@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment / local config
+.env
+*.local
+
+# Logs and benchmark outputs
+*.log
+accuracy_outputs/
+smoke_*.log
+
+# Models and large binaries
+*.gguf
+models/
+*.bin
+*.safetensors
+
+# .NET / editor artifacts if copied in later
+bin/
+obj/
+.vs/
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini
