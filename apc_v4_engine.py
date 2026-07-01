@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from typing import Any, Sequence
 
+from rubric_schema import RUBRIC_LEVELS
+
 
 PROMPT_VECTOR_SIZE = 26
 VECTOR_SIZE = 44
@@ -99,12 +101,58 @@ def _mismatch_score(over_scope: float, under_answer: float, role_escalation: flo
     return 0.25 * over_scope + 0.15 * under_answer + 0.20 * role_escalation + 0.25 * agency_takeover + 0.15 * form_pedagogy
 
 
-def _confirmation_reasons(names_and_values: Sequence[tuple[str, float]], alignment_score: float, mismatch_score: float) -> list[str]:
+def _infer_output_level(
+    complete_solution: float,
+    direct_code_patch: float,
+    review_feedback: float,
+    tests: float,
+    explanation: float,
+    narrow_reference: float,
+) -> str | None:
+    """Classify which rubric level the AI_OUTPUT itself resembles, based on its form.
+
+    Ordered from most to least "delegated" so that when several forms are present
+    at once (e.g. an explanation padded with a full worked code example), the
+    reading reflects the broadest scope the output actually delivered.
+    """
+
+    if _active(complete_solution):
+        return "L1"
+    if _active(direct_code_patch):
+        return "L2"
+    if _active(review_feedback) or _active(tests):
+        return "L5"
+    if _active(explanation):
+        return "L3"
+    if _active(narrow_reference):
+        return "L6"
+    return None
+
+
+def _confirmation_reasons(
+    names_and_values: Sequence[tuple[str, float]],
+    alignment_score: float,
+    mismatch_score: float,
+    candidate_level: str,
+    output_level: str | None,
+) -> list[str]:
     reasons = [name for name, value in names_and_values if _active(value)]
     if alignment_score < ALIGNMENT_ACCEPT_THRESHOLD:
         reasons.append(f"alignment_score_below_{ALIGNMENT_ACCEPT_THRESHOLD:.2f}")
     if mismatch_score >= MISMATCH_REJECT_THRESHOLD:
         reasons.append(f"mismatch_score_at_or_above_{MISMATCH_REJECT_THRESHOLD:.2f}")
+    # Warn using the level the OUTPUT itself resembles (not the prompt's
+    # candidate_level), so SV sees e.g. "AI answered like L3" instead of a
+    # generic mismatch code when the mismatch is really a level shift.
+    if output_level is not None and output_level != candidate_level:
+        output_rubric = RUBRIC_LEVELS[output_level]
+        candidate_rubric = RUBRIC_LEVELS[candidate_level]
+        reasons.append(
+            f"output_behaves_like_{output_level}_not_{candidate_level}: "
+            f"AI_OUTPUT matches '{output_rubric.name}' pattern ({output_rubric.core_definition}) "
+            f"but candidate level is {candidate_level} ('{candidate_rubric.name}'), which expects: "
+            f"{candidate_rubric.output_should}"
+        )
     return reasons
 
 
@@ -237,6 +285,11 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
     gated_margin = _top_margin(gated_probs)
 
     output_present = _active(o_present)
+    output_level = (
+        _infer_output_level(o_complete_solution, o_direct_code_patch, o_review_feedback, o_tests, o_explanation, o_narrow_reference)
+        if output_present
+        else None
+    )
 
     # For levels where extensive explanation is not required, pedagogy is considered OK unless an explicit mismatch fires.
     pedagogy_effective = o_pedagogy_aligned
@@ -293,7 +346,7 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         transaction_status = "output_mismatch_requires_confirmation"
         final_status = "requires_student_confirmation"
         requires_student_confirmation = True
-        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score)
+        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score, candidate_level, output_level)
     else:
         final_level = candidate_level
         accept = int(
@@ -322,6 +375,8 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         "has_mismatch": bool(active_mismatches) if output_present else None,
         "active_mismatches": active_mismatches if output_present else [],
         "confirmation_reasons": confirmation_reasons,
+        "output_level": output_level,
+        "output_level_name": RUBRIC_LEVELS[output_level].name if output_level else None,
         "mismatch_types": {
             "over_scope_broader": _active(m_over_scope),
             "under_answer_missing": _active(m_under_answer),
