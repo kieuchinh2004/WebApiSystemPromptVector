@@ -1,13 +1,12 @@
-"""Deterministic APC v4 scoring engine.
+"""Deterministic APC v4 transaction scoring engine.
 
-The methodology defines phi(p) in [0, 1]^24.  The deployed API prepends two
-operational bits:
-
-    index 0: is_coding
-    index 1: has_context
-
-so this module accepts a 26-dimensional vector in [0, 1].  Binary strings are
-still accepted as a compatibility shorthand.
+Rubric-grounded vector model:
+- Rubric is the theoretical standard for L0-L6.
+- Prompt vector operationalizes Artifact / Expectation / Contribution to select
+  a candidate student level.
+- Output vector does NOT re-score the student's capability.  It only checks
+  whether AI_OUTPUT matched the student's expectation.  If it did not match, the
+  engine keeps candidate_level but returns a confirmation-required status.
 """
 
 from __future__ import annotations
@@ -16,35 +15,44 @@ import math
 from typing import Any, Sequence
 
 
-VECTOR_SIZE = 26
+PROMPT_VECTOR_SIZE = 26
+VECTOR_SIZE = 44
 TAU = 8.0
 ACCEPT_CONFIDENCE = 0.60
 ACCEPT_MARGIN = 0.15
 GATING_THRESHOLD = 0.50
+ALIGNMENT_ACCEPT_THRESHOLD = 0.75
+MISMATCH_REJECT_THRESHOLD = 0.30
 
 LEVELS = tuple(f"L{i}" for i in range(1, 7))
 CONTEXT_LEVEL = "Thieu context"
+CONFIRMATION_LEVEL = "Can hoi lai SV"
 
 
 def _parse_vector(vector_input: str | Sequence[float | int]) -> list[float]:
+    """Parse either legacy 26D prompt vector or new 44D transaction vector."""
+
     if isinstance(vector_input, str):
         vector_str = "".join(vector_input.split())
-        if len(vector_str) != VECTOR_SIZE or not all(c in "01" for c in vector_str):
+        if len(vector_str) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE) or not all(c in "01" for c in vector_str):
             raise ValueError(
-                f"Vector string must contain exactly {VECTOR_SIZE} binary characters, "
+                f"Vector string must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters, "
                 f"got {len(vector_str)}: {vector_str!r}"
             )
-        return [float(c) for c in vector_str]
+        values = [float(c) for c in vector_str]
+    else:
+        if len(vector_input) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE):
+            raise ValueError(
+                f"Vector list must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} elements, "
+                f"got {len(vector_input)}"
+            )
+        values = [float(v) for v in vector_input]
+        invalid = [v for v in values if not 0.0 <= v <= 1.0]
+        if invalid:
+            raise ValueError(f"Vector values must be in [0, 1], got invalid values: {invalid[:5]}")
 
-    if len(vector_input) != VECTOR_SIZE:
-        raise ValueError(
-            f"Vector list must contain exactly {VECTOR_SIZE} elements, got {len(vector_input)}"
-        )
-
-    values = [float(v) for v in vector_input]
-    invalid = [v for v in values if not 0.0 <= v <= 1.0]
-    if invalid:
-        raise ValueError(f"All vector values must be in [0, 1], got invalid values: {invalid[:5]}")
+    if len(values) == PROMPT_VECTOR_SIZE:
+        values = values + [0.0] * (VECTOR_SIZE - PROMPT_VECTOR_SIZE)
     return values
 
 
@@ -62,7 +70,6 @@ def _softmax(scores: Sequence[float], active: Sequence[bool] | None = None) -> l
     if not active_scores:
         raise ValueError("At least one active level is required")
 
-    # Numerical stability: subtract max active logit.
     max_logit = max(TAU * score for score in active_scores)
     exps: list[float] = []
     for score, enabled in zip(scores, active):
@@ -78,28 +85,72 @@ def _top_margin(probs: Sequence[float]) -> float:
     return sorted_probs[0] - sorted_probs[1]
 
 
+def _active(value: float) -> bool:
+    return value >= GATING_THRESHOLD
+
+
+def _alignment_score(role: float, scope: float, agency: float, form: float, pedagogy: float) -> float:
+    # Role/scope/agency are weighted highest because they protect against output-driven misclassification.
+    return 0.25 * role + 0.25 * scope + 0.20 * agency + 0.15 * form + 0.15 * pedagogy
+
+
+def _mismatch_score(over_scope: float, under_answer: float, role_escalation: float, agency_takeover: float, form_pedagogy: float) -> float:
+    # Over-scope and agency takeover are most harmful in learning analytics because AI behavior can hide student agency.
+    return 0.25 * over_scope + 0.15 * under_answer + 0.20 * role_escalation + 0.25 * agency_takeover + 0.15 * form_pedagogy
+
+
+def _confirmation_reasons(names_and_values: Sequence[tuple[str, float]], alignment_score: float, mismatch_score: float) -> list[str]:
+    reasons = [name for name, value in names_and_values if _active(value)]
+    if alignment_score < ALIGNMENT_ACCEPT_THRESHOLD:
+        reasons.append(f"alignment_score_below_{ALIGNMENT_ACCEPT_THRESHOLD:.2f}")
+    if mismatch_score >= MISMATCH_REJECT_THRESHOLD:
+        reasons.append(f"mismatch_score_at_or_above_{MISMATCH_REJECT_THRESHOLD:.2f}")
+    return reasons
+
+
 def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
-    """Compute APC scores, gated prediction, confidence, and accept status."""
+    """Compute APC scores, gated prediction, confidence, and transaction status."""
 
     x = _parse_vector(vector_input)
     vector_values = [round(value, 4) for value in x]
     vector_str = _binary_view(x)
 
-    is_coding = x[0] >= GATING_THRESHOLD
-    has_context = x[1] >= GATING_THRESHOLD
+    is_coding = _active(x[0])
+    has_context = _active(x[1])
 
     a1, a2, a3, a4, a5, a6, a7 = x[2:9]
     d1, d2, d3, d4, d5, d6, d7 = x[9:16]
     r1, r2, r3, r4, r5, r6, r7, r8, r9, r10 = x[16:26]
 
+    (
+        o_present,
+        o_role_aligned,
+        o_scope_aligned,
+        o_agency_aligned,
+        o_form_aligned,
+        o_pedagogy_aligned,
+        o_asks_clarification,
+        o_complete_solution,
+        o_direct_code_patch,
+        o_explanation,
+        o_review_feedback,
+        o_tests,
+        o_narrow_reference,
+        m_over_scope,
+        m_under_answer,
+        m_role_escalation,
+        m_agency_takeover,
+        m_form_pedagogy_mismatch,
+    ) = x[26:44]
+
     constraint_warnings: list[str] = []
     if a6 >= GATING_THRESHOLD and a7 >= GATING_THRESHOLD:
         constraint_warnings.append(
-            "Invalid feature combination: a6(extensive_context) and a7(small_snippet) "
-            "are both active. Scoring kept the values but accept is forced to 0."
+            "Invalid feature combination: a6(extensive_context) and a7(small_snippet) are both active. "
+            "Scoring kept the values but accept is forced to 0."
         )
 
-    # Score formulas from Methodology_APC_24F_v4_Corrected.docx Appendix A.
+    # Prompt-side score formulas.  These select candidate_level only.
     s1 = (
         0.30 * r1
         + 0.10 * (1 - a1)
@@ -178,32 +229,120 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
             valid_levels.append((score, idx + 1))
 
     selected_score, predicted_level_idx = max(valid_levels, key=lambda item: (item[0], item[1]))
-    predicted_level_math = f"L{predicted_level_idx}"
+    candidate_level = f"L{predicted_level_idx}"
 
-    # Keep both probability views.  all_probs is useful for diagnostics; gated_probs
-    # is the probability distribution used for confidence/accept.
     all_probs = _softmax(scores)
     gated_probs = _softmax(scores, gatings)
     selected_prob = gated_probs[predicted_level_idx - 1]
     gated_margin = _top_margin(gated_probs)
 
+    output_present = _active(o_present)
+
+    # For levels where extensive explanation is not required, pedagogy is considered OK unless an explicit mismatch fires.
+    pedagogy_effective = o_pedagogy_aligned
+    if output_present and candidate_level in {"L1", "L2", "L6"} and not _active(m_form_pedagogy_mismatch):
+        pedagogy_effective = max(pedagogy_effective, 1.0)
+
+    alignment_score = _alignment_score(
+        o_role_aligned,
+        o_scope_aligned,
+        o_agency_aligned,
+        o_form_aligned,
+        pedagogy_effective,
+    )
+    mismatch_score = _mismatch_score(
+        m_over_scope,
+        m_under_answer,
+        m_role_escalation,
+        m_agency_takeover,
+        m_form_pedagogy_mismatch,
+    )
+
+    mismatch_names = [
+        ("over_scope_broader", m_over_scope),
+        ("under_answer_missing", m_under_answer),
+        ("role_escalation", m_role_escalation),
+        ("agency_takeover", m_agency_takeover),
+        ("form_or_pedagogy_mismatch", m_form_pedagogy_mismatch),
+    ]
+    active_mismatches = [name for name, value in mismatch_names if _active(value)]
+    output_aligned = (
+        output_present
+        and alignment_score >= ALIGNMENT_ACCEPT_THRESHOLD
+        and mismatch_score < MISMATCH_REJECT_THRESHOLD
+        and not active_mismatches
+    )
+
     if not has_context:
         final_level = CONTEXT_LEVEL
         accept = 0
+        transaction_status = "missing_context"
+        final_status = "rejected_missing_context"
+        requires_student_confirmation = False
+        confirmation_reasons: list[str] = []
     elif not is_coding:
         final_level = "L0"
         accept = 0
+        transaction_status = "non_coding"
+        final_status = "rejected_non_coding"
+        requires_student_confirmation = False
+        confirmation_reasons = []
+    elif output_present and not output_aligned:
+        final_level = CONFIRMATION_LEVEL
+        accept = 0
+        transaction_status = "output_mismatch_requires_confirmation"
+        final_status = "requires_student_confirmation"
+        requires_student_confirmation = True
+        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score)
     else:
-        final_level = predicted_level_math
+        final_level = candidate_level
         accept = int(
             selected_prob >= ACCEPT_CONFIDENCE
             and gated_margin >= ACCEPT_MARGIN
             and not constraint_warnings
         )
+        transaction_status = "prompt_only" if not output_present else "output_aligned"
+        final_status = "accepted" if accept else "low_confidence_or_constraint_warning"
+        requires_student_confirmation = False
+        confirmation_reasons = []
+
+    output_diagnostics = {
+        "output_present": output_present,
+        "output_aligned": output_aligned if output_present else None,
+        "alignment_score": round(alignment_score, 4) if output_present else None,
+        "mismatch_score": round(mismatch_score, 4) if output_present else None,
+        "alignment_threshold": ALIGNMENT_ACCEPT_THRESHOLD,
+        "mismatch_threshold": MISMATCH_REJECT_THRESHOLD,
+        "role_aligned": _active(o_role_aligned) if output_present else None,
+        "scope_aligned": _active(o_scope_aligned) if output_present else None,
+        "agency_aligned": _active(o_agency_aligned) if output_present else None,
+        "form_aligned": _active(o_form_aligned) if output_present else None,
+        "pedagogy_aligned": _active(pedagogy_effective) if output_present else None,
+        "asks_clarification": _active(o_asks_clarification) if output_present else None,
+        "has_mismatch": bool(active_mismatches) if output_present else None,
+        "active_mismatches": active_mismatches if output_present else [],
+        "confirmation_reasons": confirmation_reasons,
+        "mismatch_types": {
+            "over_scope_broader": _active(m_over_scope),
+            "under_answer_missing": _active(m_under_answer),
+            "role_escalation": _active(m_role_escalation),
+            "agency_takeover": _active(m_agency_takeover),
+            "form_or_pedagogy_mismatch": _active(m_form_pedagogy_mismatch),
+        } if output_present else {},
+        "output_forms": {
+            "complete_solution": _active(o_complete_solution),
+            "direct_code_patch": _active(o_direct_code_patch),
+            "explanation": _active(o_explanation),
+            "review_feedback": _active(o_review_feedback),
+            "tests": _active(o_tests),
+            "narrow_reference": _active(o_narrow_reference),
+        } if output_present else {},
+    }
 
     return {
         "level": final_level,
-        "predicted_level_math": predicted_level_math,
+        "candidate_level": candidate_level,
+        "predicted_level_math": candidate_level,  # backward compatibility
         "score": round(selected_score, 4),
         "confidence": round(selected_prob, 4),
         "margin": round(gated_margin, 4),
@@ -217,4 +356,11 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         "vector_str": vector_str,
         "vector_values": vector_values,
         "constraint_warnings": constraint_warnings,
+        "transaction_status": transaction_status,
+        "final_status": final_status,
+        "requires_student_confirmation": requires_student_confirmation,
+        "confirmation_reasons": confirmation_reasons,
+        "alignment_score": round(alignment_score, 4) if output_present else None,
+        "mismatch_score": round(mismatch_score, 4) if output_present else None,
+        "output_diagnostics": output_diagnostics,
     }

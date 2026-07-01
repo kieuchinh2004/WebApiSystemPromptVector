@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 import classifier
 import config as cfg
 import llama_manager
+from rubric_schema import rubric_as_dict
 from vector_schema import vector_detail
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
@@ -19,7 +20,8 @@ app = FastAPI(
     title="Prompt Classifier API (Vector + APC v4)",
     description=(
         "Web API phân loại prompt học sinh theo khung APC v4 (24 đặc trưng + 2 prefix bits) "
-        "bằng mô hình LLM chạy cục bộ kết hợp với bộ tính toán toán học tĩnh."
+        "bằng mô hình LLM chạy cục bộ kết hợp với bộ tính toán toán học tĩnh. "
+        "Bản mới hỗ trợ transaction Prompt + Output để phát hiện mismatch và hỏi lại SV."
     ),
     version="2.0.0",
 )
@@ -37,6 +39,8 @@ app.add_middleware(
 class ClassifyRequest(BaseModel):
     prompt: Optional[str] = Field(None, description="Prompt của học sinh cần phân loại")
     student_prompt: Optional[str] = Field(None, description="Alias của 'prompt'")
+    ai_output: Optional[str] = Field(None, description="Output AI đã trả về cho prompt này, dùng để đánh giá transaction Prompt + Output")
+    output: Optional[str] = Field(None, description="Alias của 'ai_output'")
 
 
 class ClassifyResponse(BaseModel):
@@ -46,15 +50,23 @@ class ClassifyResponse(BaseModel):
     borderline_with: Optional[str] = Field(None, description="Nhãn phân loại borderline (nếu có)")
     is_coding: bool = Field(..., description="Đặc trưng prefix: Có phải lập trình/coding?")
     has_context: bool = Field(..., description="Đặc trưng prefix: Đủ context và an toàn?")
-    predicted_level_math: str = Field(..., description="Nhãn phân loại tính bằng công thức toán (bỏ qua prefix)")
+    candidate_level: str = Field(..., description="Candidate level chấm từ STUDENT_PROMPT trước khi xét AI_OUTPUT")
+    predicted_level_math: str = Field(..., description="Alias backward-compatible của candidate_level")
     score: float = Field(..., description="Điểm số cao nhất của nhãn được chọn")
     margin: float = Field(..., description="Khoảng cách độ tin cậy giữa nhãn cao nhất và nhãn cao nhì")
     accept: int = Field(..., description="1: Chấp nhận kết quả (đáp ứng điều kiện biên), 0: Từ chối/Cảnh báo")
-    vector: str = Field(..., description="Vector 26-bit nhị phân được trích xuất từ prompt")
+    vector: str = Field(..., description="Vector 44-bit transaction-level được trích xuất từ Prompt + Output; legacy 26-bit được pad khi cần")
     explanation: str = Field(..., description="Giải thích/Lập luận của LLM cho việc gán vector")
     scores: List[float] = Field(..., description="Danh sách điểm số của 6 levels S1..S6")
     gatings: List[bool] = Field(..., description="Trạng thái cổng lọc G1..G6")
     probs: List[float] = Field(..., description="Danh sách xác suất Softmax tương ứng P1..P6")
+    transaction_status: str = Field(..., description="prompt_only | output_aligned | output_mismatch_requires_confirmation | missing_context | non_coding")
+    final_status: str = Field(..., description="accepted | requires_student_confirmation | rejected_* | low_confidence_or_constraint_warning")
+    requires_student_confirmation: bool = Field(..., description="True nếu AI_OUTPUT lệch expectation và cần hỏi lại sinh viên trước khi chấm cuối")
+    confirmation_reasons: List[str] = Field(default_factory=list, description="Lý do cần hỏi lại SV nếu output mismatch")
+    alignment_score: Optional[float] = Field(None, description="Điểm output alignment có trọng số; chỉ có khi có AI_OUTPUT")
+    mismatch_score: Optional[float] = Field(None, description="Điểm output mismatch có trọng số; chỉ có khi có AI_OUTPUT")
+    output_diagnostics: dict[str, Any] = Field(default_factory=dict, description="Chẩn đoán alignment/mismatch của AI_OUTPUT")
     latency_seconds: float = Field(..., description="Thời gian suy luận của LLM và xử lý (giây)")
     completion_tokens: int = Field(..., description="Số token đầu ra LLM")
     prompt_tokens: int = Field(..., description="Số token đầu vào LLM")
@@ -74,6 +86,9 @@ class ClassifyDebugResponse(ClassifyResponse):
     )
     constraint_warnings: List[str] = Field(
         default_factory=list, description="Các cảnh báo constraint của engine."
+    )
+    rule_evidence: dict[str, Any] = Field(
+        default_factory=dict, description="Rule-based evidence được merge vào vector cuối."
     )
 
 
@@ -129,7 +144,7 @@ async def on_shutdown():
 async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
     """
     Nhận prompt học sinh và trả về phân loại APC v4 chi tiết.
-    - Trích xuất 26 đặc trưng (2 prefix + 24 features) qua mô hình LLM.
+    - Trích xuất 44 đặc trưng transaction-level (26 prompt + 18 output/mismatch) qua mô hình LLM.
     - Chạy bộ suy luận toán học tĩnh (score, gating, softmax, accept) để đưa ra kết quả.
     """
     text = body.prompt or body.student_prompt
@@ -143,8 +158,9 @@ async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
         )
 
     loop = asyncio.get_event_loop()
+    ai_output_text = body.ai_output or body.output
     result, latency, metrics = await loop.run_in_executor(
-        None, classifier.classify_with_retry, text.strip()
+        None, classifier.classify_with_retry, text.strip(), ai_output_text.strip() if ai_output_text else None
     )
 
     return ClassifyResponse(
@@ -154,6 +170,7 @@ async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
         borderline_with=None,
         is_coding=result["is_coding"],
         has_context=result["has_context"],
+        candidate_level=result.get("candidate_level", result.get("predicted_level_math", "N/A")),
         predicted_level_math=result["predicted_level_math"],
         score=result["score"],
         margin=result["margin"],
@@ -163,6 +180,13 @@ async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
         scores=result["scores"],
         gatings=result["gatings"],
         probs=result["probs"],
+        transaction_status=result.get("transaction_status", "unknown"),
+        final_status=result.get("final_status", "unknown"),
+        requires_student_confirmation=bool(result.get("requires_student_confirmation", False)),
+        confirmation_reasons=result.get("confirmation_reasons", []),
+        alignment_score=result.get("alignment_score"),
+        mismatch_score=result.get("mismatch_score"),
+        output_diagnostics=result.get("output_diagnostics", {}),
         latency_seconds=round(latency, 3),
         completion_tokens=int(metrics["completion_tokens"]),
         prompt_tokens=int(metrics["prompt_tokens"]),
@@ -186,8 +210,9 @@ async def classify_prompt_debug(body: ClassifyRequest) -> ClassifyDebugResponse:
         )
 
     loop = asyncio.get_event_loop()
+    ai_output_text = body.ai_output or body.output
     result, latency, metrics = await loop.run_in_executor(
-        None, classifier.classify_with_retry, text.strip()
+        None, classifier.classify_with_retry, text.strip(), ai_output_text.strip() if ai_output_text else None
     )
 
     return ClassifyDebugResponse(
@@ -197,6 +222,7 @@ async def classify_prompt_debug(body: ClassifyRequest) -> ClassifyDebugResponse:
         borderline_with=None,
         is_coding=result["is_coding"],
         has_context=result["has_context"],
+        candidate_level=result.get("candidate_level", result.get("predicted_level_math", "N/A")),
         predicted_level_math=result["predicted_level_math"],
         score=result["score"],
         margin=result["margin"],
@@ -206,16 +232,30 @@ async def classify_prompt_debug(body: ClassifyRequest) -> ClassifyDebugResponse:
         scores=result["scores"],
         gatings=result["gatings"],
         probs=result["probs"],
+        transaction_status=result.get("transaction_status", "unknown"),
+        final_status=result.get("final_status", "unknown"),
+        requires_student_confirmation=bool(result.get("requires_student_confirmation", False)),
+        confirmation_reasons=result.get("confirmation_reasons", []),
+        alignment_score=result.get("alignment_score"),
+        mismatch_score=result.get("mismatch_score"),
+        output_diagnostics=result.get("output_diagnostics", {}),
         latency_seconds=round(latency, 3),
         completion_tokens=int(metrics["completion_tokens"]),
         prompt_tokens=int(metrics["prompt_tokens"]),
         total_tokens=int(metrics["total_tokens"]),
         tokens_per_second=float(metrics["tokens_per_second"]),
-        final_vector_detail=vector_detail(result.get("vector_values")),
+        final_vector_detail=vector_detail(result.get("final_vector_values") or result.get("vector_values")),
         llm_vector_detail=vector_detail(result.get("llm_vector_values")),
         llm_payload=result.get("llm_payload", {}),
         constraint_warnings=result.get("constraint_warnings", []),
+        rule_evidence=result.get("rule_evidence", {}),
     )
+
+
+@app.get("/rubric", summary="Xem rubric lý thuyết L0-L6 và các chiều đánh giá")
+async def rubric():
+    """Trả về rubric schema dùng làm nền lý thuyết cho vector engine."""
+    return rubric_as_dict()
 
 
 @app.get("/health", response_model=HealthResponse, summary="Kiểm tra sức khỏe API")

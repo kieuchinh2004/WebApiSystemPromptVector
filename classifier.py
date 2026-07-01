@@ -10,7 +10,8 @@ import urllib.request
 from typing import Any
 
 import config as cfg
-from apc_v4_engine import VECTOR_SIZE, compute_apc_v4
+from apc_v4_engine import PROMPT_VECTOR_SIZE, VECTOR_SIZE, compute_apc_v4
+from rule_based_extractor import extract_rule_vector, merge_rule_and_llm_vectors, rule_evidence_as_dict
 
 
 _system_prompt_cache: str | None = None
@@ -51,8 +52,10 @@ def _clean_json_markdown(content: str) -> str:
 def _coerce_feature_list(value: Any, field_name: str) -> list[float]:
     if not isinstance(value, list):
         raise VectorParseError(f"'{field_name}' must be a list")
-    if len(value) != VECTOR_SIZE:
-        raise VectorParseError(f"'{field_name}' must contain exactly {VECTOR_SIZE} values, got {len(value)}")
+    if len(value) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE):
+        raise VectorParseError(
+            f"'{field_name}' must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} values, got {len(value)}"
+        )
 
     features: list[float] = []
     for idx, item in enumerate(value):
@@ -72,9 +75,10 @@ def _coerce_binary_vector(value: Any) -> list[float]:
     if not isinstance(value, str):
         raise VectorParseError("'vector' must be a string")
     vector = "".join(value.split())
-    if len(vector) != VECTOR_SIZE or not all(c in "01" for c in vector):
+    if len(vector) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE) or not all(c in "01" for c in vector):
         raise VectorParseError(
-            f"'vector' must contain exactly {VECTOR_SIZE} binary characters, got {len(vector)}: {vector!r}"
+            f"'vector' must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters, "
+            f"got {len(vector)}: {vector!r}"
         )
     return [float(c) for c in vector]
 
@@ -83,9 +87,11 @@ def parse_vector_from_content(content: str) -> tuple[list[float], str, dict[str,
     """Parse a strict JSON vector response from the LLM.
 
     Accepted payloads:
-      {"features": [26 numeric values in [0,1]], "explanation": "..."}
-      {"vector_values": [26 numeric values in [0,1]], "explanation": "..."}
-      {"vector": "26 binary chars", "explanation": "..."}
+      {"features": [44 numeric values in [0,1]], "explanation": "..."}
+      {"vector_values": [44 numeric values in [0,1]], "explanation": "..."}
+      {"vector": "44 binary chars", "explanation": "..."}
+
+    Legacy 26D prompt-only vectors are accepted and padded by the engine.
 
     No pad/truncate fallback is used; wrong-length output is unsafe because it
     shifts feature meanings.
@@ -115,10 +121,20 @@ def parse_vector_from_content(content: str) -> tuple[list[float], str, dict[str,
     raise VectorParseError("LLM JSON must include one of: 'features', 'vector_values', or 'vector'")
 
 
-def _build_messages(system_prompt: str, student_prompt: str, repair_error: str | None = None) -> list[dict[str, str]]:
+def _build_messages(
+    system_prompt: str,
+    student_prompt: str,
+    ai_output: str | None = None,
+    repair_error: str | None = None,
+) -> list[dict[str, str]]:
+    if ai_output and ai_output.strip():
+        user_content = f"STUDENT_PROMPT:\n{student_prompt}\n\nAI_OUTPUT:\n{ai_output.strip()}"
+    else:
+        user_content = f"student_prompt: {student_prompt}"
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"student_prompt: {student_prompt}"},
+        {"role": "user", "content": user_content},
     ]
     if repair_error:
         messages.append(
@@ -127,8 +143,8 @@ def _build_messages(system_prompt: str, student_prompt: str, repair_error: str |
                 "content": (
                     "Your previous output was invalid: "
                     f"{repair_error}. Return ONLY one valid JSON object with either "
-                    f"'features' as exactly {VECTOR_SIZE} numbers in [0,1], or 'vector' as exactly "
-                    f"{VECTOR_SIZE} binary characters. No markdown, no prose."
+                    f"'features' as exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} numbers in [0,1], or 'vector' as exactly "
+                    f"{PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters. No markdown, no prose."
                 ),
             }
         )
@@ -157,7 +173,7 @@ def _call_llama(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
     return body["choices"][0]["message"]["content"], body
 
 
-def classify_with_retry(student_prompt: str) -> tuple[dict[str, Any], float, dict[str, Any]]:
+def classify_with_retry(student_prompt: str, ai_output: str | None = None) -> tuple[dict[str, Any], float, dict[str, Any]]:
     """Extract vector with the LLM, then run deterministic APC v4 scoring."""
 
     system_prompt = get_system_prompt()
@@ -175,15 +191,23 @@ def classify_with_retry(student_prompt: str) -> tuple[dict[str, Any], float, dic
 
     for attempt in range(cfg.RETRY_COUNT):
         try:
-            messages = _build_messages(system_prompt, student_prompt, last_parse_error)
+            messages = _build_messages(system_prompt, student_prompt, ai_output, last_parse_error)
             raw_content, body = _call_llama(messages)
             print(f"[classifier] Raw LLM content attempt={attempt + 1}: {repr(raw_content)}")
 
             llm_vector_values, explanation, parsed_payload = parse_vector_from_content(raw_content)
-            engine_res = compute_apc_v4(llm_vector_values)
-            engine_res["explanation"] = f"LLM: {explanation}"
+            rule_evidence = extract_rule_vector(student_prompt, ai_output)
+            final_vector_values = merge_rule_and_llm_vectors(llm_vector_values, rule_evidence)
+            engine_res = compute_apc_v4(final_vector_values)
+            engine_res["explanation"] = (
+                "Rubric-grounded vector result. "
+                f"LLM extraction: {explanation}. "
+                "Rule-based evidence was merged as deterministic lower-bound overrides for observable features."
+            )
             engine_res["llm_payload"] = parsed_payload
             engine_res["llm_vector_values"] = [round(v, 4) for v in llm_vector_values]
+            engine_res["final_vector_values"] = [round(v, 4) for v in final_vector_values]
+            engine_res["rule_evidence"] = rule_evidence_as_dict(rule_evidence)
 
             latency = time.time() - t0
             usage = body.get("usage", {})
@@ -209,6 +233,7 @@ def classify_with_retry(student_prompt: str) -> tuple[dict[str, Any], float, dic
     latency = time.time() - t0
     return {
         "level": "Loi phan tich",
+        "candidate_level": "N/A",
         "predicted_level_math": "N/A",
         "score": 0.0,
         "confidence": 0.0,
@@ -222,6 +247,16 @@ def classify_with_retry(student_prompt: str) -> tuple[dict[str, Any], float, dic
         "has_context": False,
         "vector_str": "0" * VECTOR_SIZE,
         "vector_values": [0.0] * VECTOR_SIZE,
+        "final_vector_values": [0.0] * VECTOR_SIZE,
+        "llm_vector_values": [0.0] * VECTOR_SIZE,
+        "rule_evidence": {},
         "constraint_warnings": [],
+        "transaction_status": "extractor_error",
+        "final_status": "extractor_error",
+        "requires_student_confirmation": False,
+        "confirmation_reasons": [],
+        "alignment_score": None,
+        "mismatch_score": None,
+        "output_diagnostics": {},
         "explanation": f"Lỗi sau {cfg.RETRY_COUNT} lượt thử: {last_exception}. Raw={raw_content[:200]!r}",
     }, latency, default_metrics
