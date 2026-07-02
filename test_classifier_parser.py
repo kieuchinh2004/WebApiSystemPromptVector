@@ -4,6 +4,14 @@ from classifier import VectorParseError, parse_vector_from_content
 
 
 class TestClassifierParser(unittest.TestCase):
+    def test_parse_binary_vector_without_explanation(self):
+        vector = "10" + "0" * 58
+        values, explanation, payload = parse_vector_from_content('{"vector":"' + vector + '"}')
+        self.assertEqual(len(values), 60)
+        self.assertEqual(values[:2], [1.0, 0.0])
+        self.assertEqual(explanation, "Vector extracted without explanation.")
+        self.assertEqual(payload["vector"], vector)
+
     def test_parse_binary_vector(self):
         vector = "10" + "0" * 24
         values, explanation, payload = parse_vector_from_content(

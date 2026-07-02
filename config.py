@@ -1,6 +1,11 @@
 import importlib.util
 import os
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 load_dotenv()
 
@@ -69,6 +74,6 @@ LLAMA_UBATCH = int(os.getenv("LLAMA_UBATCH", str(getattr(_model_config, "LLAMA_U
 
 # Inference tuning parameters (loaded from ThongSoModel profile, falling back to defaults)
 TEMPERATURE = float(os.getenv("TEMPERATURE", str(getattr(_model_config, "TEMPERATURE", 0.0))))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", str(getattr(_model_config, "MAX_TOKENS", 128))))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", str(getattr(_model_config, "MAX_TOKENS", 256))))
 TOP_P = float(os.getenv("TOP_P", str(getattr(_model_config, "TOP_P", 1.0))))
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", str(getattr(_model_config, "RETRY_COUNT", 3))))

@@ -21,6 +21,28 @@ class VectorParseError(ValueError):
     """Raised when the LLM output cannot be trusted as a valid APC vector."""
 
 
+_ALLOWED_VECTOR_LENGTHS = (
+    PROMPT_VECTOR_SIZE,
+    LEGACY_PROMPT_VECTOR_SIZE,
+    LEGACY_TRANSACTION_VECTOR_SIZE,
+    VECTOR_SIZE,
+)
+
+
+def _allowed_lengths_text() -> str:
+    return ", ".join(str(length) for length in _ALLOWED_VECTOR_LENGTHS)
+
+
+def _preferred_output_contract() -> str:
+    return (
+        "Return ONLY one compact JSON object. Preferred shape: "
+        f'{{"vector":"<{VECTOR_SIZE} binary chars>"}}. '
+        "Optional field: \"explanation\" with at most one short sentence. "
+        "Prefer \"vector\" over \"features\" or \"vector_values\" because it is shorter. "
+        "No markdown, no code fences, no comments, no trailing commas."
+    )
+
+
 def get_system_prompt() -> str:
     """Read and cache the system prompt."""
     global _system_prompt_cache
@@ -87,9 +109,10 @@ def parse_vector_from_content(content: str) -> tuple[list[float], str, dict[str,
     """Parse a strict JSON vector response from the LLM.
 
     Accepted payloads:
+      {"vector": "60 binary chars"}
+      {"vector": "60 binary chars", "explanation": "..."}
       {"features": [60 numeric values in [0,1]], "explanation": "..."}
       {"vector_values": [60 numeric values in [0,1]], "explanation": "..."}
-      {"vector": "60 binary chars", "explanation": "..."}
 
     Legacy 26D prompt-only and 44D transaction vectors are accepted and mapped by the engine.
 
@@ -135,6 +158,7 @@ def _build_messages(
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
+        {"role": "user", "content": _preferred_output_contract()},
     ]
     if repair_error:
         messages.append(
@@ -142,9 +166,9 @@ def _build_messages(
                 "role": "user",
                 "content": (
                     "Your previous output was invalid: "
-                    f"{repair_error}. Return ONLY one valid JSON object with either "
-                    f"'features' as exactly one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} numbers in [0,1], or 'vector' as exactly "
-                    f"one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} binary characters. No markdown, no prose."
+                    f"{repair_error}. "
+                    f"{_preferred_output_contract()} "
+                    f"If you cannot use 'vector', then use 'features' or 'vector_values' with exactly one of {_allowed_lengths_text()} numbers in [0,1]."
                 ),
             }
         )

@@ -104,5 +104,12 @@ Important examples:
 - Business-language vibe code like "make an app for booking rooms" => L1, a1/e1/c1 high, not L4.
 - Pseudocode/flow must be code-oriented HOW such as function steps, validate -> hash -> save, algorithm, or explicit pseudocode.
 
-Return JSON with:
-{"features":[60 numbers],"explanation":"short rationale"}
+Return ONLY one compact JSON object.
+Preferred shape:
+{"vector":"60 binary characters"}
+
+Optional shorter alternative:
+{"vector":"60 binary characters","explanation":"one short sentence"}
+
+Do not return markdown, code fences, comments, trailing commas, or any prose outside JSON.
+Prefer "vector" over "features" / "vector_values" because the binary string is shorter and less likely to be truncated.
