@@ -1,4 +1,9 @@
-"""Human-readable APC transaction vector schema for diagnostics."""
+"""Human-readable transaction vector schema for Prompt A/E/C + Output 6D.
+
+Vector v4 is grounded in the two rubric sheets and the formula document:
+- Prompt side: Artifact / Expectation / Contribution.
+- Output side: Role / Scope / Agency / Form / Pedagogy / Mismatch.
+"""
 
 from __future__ import annotations
 
@@ -6,51 +11,88 @@ from typing import Any, Sequence
 
 
 VECTOR_FIELDS = [
-    ("p1", "is_coding", "STUDENT_PROMPT thuộc bài toán lập trình/coding/kỹ thuật."),
-    ("p2", "has_context", "STUDENT_PROMPT đủ context để đánh giá, không thiếu ngữ cảnh/injection."),
-    ("a1", "a1_code_block", "Prompt có code block, function, class, complete file, SQL script hoặc artifact code đáng kể."),
-    ("a2", "a2_error_trace", "Prompt có compiler/runtime error, exception, stack trace, diagnostic hoặc error message rõ."),
-    ("a3", "a3_sql_schema", "Prompt có SQL query, database schema, table definition, migration hoặc DB config."),
-    ("a4", "a4_config_file", "Prompt có JSON/YAML/INI/XML/env/build/package/Docker/config content."),
-    ("a5", "a5_system_log", "Prompt có terminal output, server log, command output, timestamped log hoặc execution trace."),
-    ("a6", "a6_extensive_context", "Prompt có context lớn, nhiều file, whole project hoặc complete solution."),
-    ("a7", "a7_small_snippet", "Prompt chỉ có một snippet/statement/artifact nhỏ, cô lập."),
-    ("d1", "d1_algorithm", "SV cung cấp algorithm steps, pseudocode, numbered flow hoặc procedural logic."),
-    ("d2", "d2_computation_logic", "SV định nghĩa formula, transformation, scoring rule hoặc computation method."),
-    ("d3", "d3_structure", "SV cung cấp class/entity/module architecture, schema design, relationships hoặc design pattern."),
-    ("d4", "d4_data_flow", "SV mô tả data/request/pipeline/protocol flow hoặc transformation A -> B -> C."),
-    ("d5", "d5_location", "SV chỉ ra file/class/function/line/module/location cụ thể cần sửa/inspect."),
-    ("d6", "d6_hypothesis", "SV đưa ra nguyên nhân/hypothesis và vẫn yêu cầu AI fix/debug."),
-    ("d7", "d7_test_cases", "SV cung cấp test input/output, expected result, validation example hoặc test cases."),
-    ("r1", "r1_create", "Prompt yêu cầu create/write/build/generate solution/app/file/program mới từ đầu."),
-    ("r2", "r2_fix", "Prompt yêu cầu fix/debug/resolve error, bug, crash hoặc malfunction."),
-    ("r3", "r3_add_feature", "Prompt yêu cầu add/extend feature trong logic/artifact hiện có."),
-    ("r4", "r4_refactor", "Prompt yêu cầu refactor/optimize/clean/format/restructure/improve code."),
-    ("r5", "r5_convert", "Prompt yêu cầu convert/migrate/translate code/config sang language/framework/format khác."),
-    ("r6", "r6_explain", "Prompt yêu cầu explain/teach/clarify why/how concept, code, bug hoặc behavior hoạt động."),
-    ("r7", "r7_implement_design", "Prompt yêu cầu implement theo algorithm/design/formula/flow do SV cung cấp."),
-    ("r8", "r8_review", "Prompt yêu cầu review/evaluate/check correctness/security/edge cases/complexity/quality."),
-    ("r9", "r9_generate_tests", "Prompt yêu cầu viết unit tests/integration tests/test cases/assertions."),
-    ("r10", "r10_syntax_lookup", "Prompt hỏi reference/syntax/API/command/parameter/regex/function signature/tool option rất hẹp."),
-    ("o1", "output_present", "Có AI_OUTPUT để đánh giá transaction Prompt + Output."),
-    ("o2", "role_aligned", "AI_OUTPUT đúng vai trò mà STUDENT_PROMPT kỳ vọng."),
-    ("o3", "scope_aligned", "AI_OUTPUT giữ đúng phạm vi yêu cầu, không mở rộng quá mức."),
-    ("o4", "agency_aligned", "AI_OUTPUT không tước quyền chủ động/đóng góp của SV so với kỳ vọng prompt."),
-    ("o5", "form_aligned", "AI_OUTPUT đúng dạng trả lời mong đợi: giải thích/code patch/review/test/syntax."),
-    ("o6", "pedagogy_aligned", "AI_OUTPUT có mức minh bạch học tập phù hợp với level/kỳ vọng."),
-    ("o7", "output_asks_clarification", "AI_OUTPUT hỏi lại để làm rõ thay vì tự làm khi thiếu ngữ cảnh."),
-    ("o8", "output_complete_solution", "AI_OUTPUT chứa complete solution/full program/full module/full implementation."),
-    ("o9", "output_direct_code_patch", "AI_OUTPUT chứa edited code/patch/replacement function/direct code changes."),
-    ("o10", "output_explanation", "AI_OUTPUT giải thích concept/mechanism/cause/trade-off/why-how."),
-    ("o11", "output_review_feedback", "AI_OUTPUT review/evaluate/check edge cases/security/quality."),
-    ("o12", "output_tests", "AI_OUTPUT cung cấp unit tests/integration tests/test cases/assertions/expected I/O."),
-    ("o13", "output_narrow_reference", "AI_OUTPUT là lookup hẹp: syntax/command/API signature/parameter/regex."),
-    ("m1", "over_scope_broader", "AI_OUTPUT rộng hơn prompt: full solution/module/architecture/implementation ngoài yêu cầu."),
-    ("m2", "under_answer_missing", "AI_OUTPUT không trả lời trọng tâm, bỏ thiếu yêu cầu chính hoặc quá mơ hồ."),
-    ("m3", "role_escalation", "AI_OUTPUT nâng vai trò AI lên mức ủy thác cao hơn prompt kỳ vọng."),
-    ("m4", "agency_takeover", "AI_OUTPUT làm thay phần lẽ ra thuộc quyền chủ động/đóng góp của SV."),
-    ("m5", "form_or_pedagogy_mismatch", "AI_OUTPUT sai dạng hoặc thiếu minh bạch học tập so với prompt."),
+    # Prefix / safety / reject-option
+    ("p1", "is_coding", "Prompt belongs to programming/coding/technical learning."),
+    ("p2", "has_context", "Prompt has enough context to evaluate and is not empty."),
+    ("p3", "non_coding", "Prompt is outside coding/technical scope."),
+    ("p4", "ambiguous", "Prompt intent is unclear or insufficient to classify."),
+    ("p5", "bypass", "Prompt contains self-label, rubric bypass, or injection-like instruction."),
+
+    # Prompt Artifact A
+    ("a1", "spec_or_vibe_only", "Only business requirement/spec/user story/vibe-code in natural language; WHAT but no HOW."),
+    ("a2", "existing_code_or_snippet", "Existing code/function/file/component/query artifact is provided."),
+    ("a3", "error_log_or_testfail", "Error message, stack trace, terminal log, or failed test is provided."),
+    ("a4", "config_sql_terminal_ide_small", "Small config key, SQL command/query, terminal command/output, IDE/environment item."),
+    ("a5", "full_solution_or_module_owned", "Student owns a complete/near-complete solution/module for checking."),
+    ("a6", "test_or_expected_behavior", "Test case, expected I/O, edge case, or pass/fail criterion is provided."),
+    ("a7", "pseudocode_flow_code_how", "Student provides pseudocode, function-level flow, algorithm, or clear HOW."),
+
+    # Prompt Expectation E
+    ("e1", "create_or_add_feature_module", "Student wants AI to create from scratch or add a feature/module/project."),
+    ("e2", "fix_optimize_refactor_existing", "Student wants AI to fix/debug/optimize/refactor existing artifact."),
+    ("e3", "explain_direction_theory_example", "Student wants direction, explanation, theory with example, or code explanation."),
+    ("e4", "implement_my_pseudocode", "Student wants AI to implement the provided pseudocode/flow/HOW."),
+    ("e5", "review_yesno_challenge", "Student wants review, yes/no verification, challenge, critique, or edge-case checking."),
+    ("e6", "minimal_lookup", "Student asks one small lookup: short theory, syntax/API, config, SQL, terminal, IDE."),
+
+    # Prompt Contribution C
+    ("c1", "what_only", "Student only contributes WHAT/spec/business requirement; no HOW."),
+    ("c2", "localized_context", "Student contributes local code/context for a task."),
+    ("c3", "debug_context_or_hypothesis", "Student gives bug location, hypothesis, error/log, or test failure context."),
+    ("c4", "student_how_flow", "Student contributes pseudocode/function flow/algorithm/HOW."),
+    ("c5", "student_solution_or_claim", "Student contributes own solution, answer, claim, or decision for review/challenge."),
+    ("c6", "exact_small_need", "Student knows the exact small item they need to look up."),
+
+    # Output presence and Role OR
+    ("o0", "output_present", "AI_OUTPUT is present for transaction-level assessment."),
+    ("or1", "out_full_build", "AI builds full code/feature/module/app or substantial new implementation."),
+    ("or2", "out_fix_optimize_refactor", "AI fixes/debugs/optimizes/refactors an existing artifact."),
+    ("or3", "out_explain_example", "AI explains, gives direction, theory, or examples."),
+    ("or4", "out_implement_pseudocode", "AI implements according to student pseudocode/flow/HOW."),
+    ("or5", "out_review_yesno_challenge", "AI reviews, gives yes/no with reasons, critiques, checks edge cases."),
+    ("or6", "out_minimal_lookup", "AI answers narrowly: short theory/syntax/config/SQL/terminal/IDE."),
+
+    # Scope OS
+    ("os1", "scope_minimal", "Output is minimal: one concept/definition/command/1-3 lines."),
+    ("os2", "scope_local", "Output is local: small snippet/example/function/patch."),
+    ("os3", "scope_module", "Output covers a feature/module."),
+    ("os4", "scope_full_system", "Output covers whole app/project/full solution."),
+
+    # Agency OG
+    ("og1", "agency_ai_led", "AI decides the main solution/design itself."),
+    ("og2", "agency_shared", "AI adds suggestions while partially preserving student intent."),
+    ("og3", "agency_student_led", "AI preserves student design/claim/agency."),
+    ("og4", "design_contamination", "AI adds or changes algorithm/architecture/design not requested."),
+    ("og5", "replaced_student_solution", "AI rewrites/replaces student solution instead of review/verification."),
+
+    # Form OF
+    ("of1", "form_full_code", "Output form is full code/full implementation."),
+    ("of2", "form_patch", "Output form is patch/fix/refactor instructions/code."),
+    ("of3", "form_explanation_example", "Output form is explanation plus example/code example."),
+    ("of4", "form_implementation", "Output form is implementation of supplied pseudocode/flow."),
+    ("of5", "form_review_checklist", "Output form is review/checklist/yes-no/challenge/test suggestions."),
+    ("of6", "form_command_short", "Output form is short command/syntax/config/SQL/terminal/IDE answer."),
+
+    # Pedagogy OT
+    ("ot1", "pedagogy_brief", "Output is brief and direct."),
+    ("ot2", "pedagogy_reasoned", "Output gives reasons/explanation."),
+    ("ot3", "pedagogy_diagnostic", "Output diagnoses causes, tradeoffs, or edge cases."),
+    ("ot4", "pedagogy_code_only", "Output is mostly copy-paste code/answer with little explanation."),
+
+    # Mismatch Delta
+    ("dlt1", "role_shift", "Observed role differs from expected role."),
+    ("dlt2", "scope_overreach", "Output scope is broader than expected scope."),
+    ("dlt3", "agency_takeover", "AI takes over design/solution when not requested."),
+    ("dlt4", "form_mismatch", "Output form differs from expected form."),
+    ("dlt5", "over_answer", "Output gives more than needed."),
+    ("dlt6", "under_answer", "Output misses the main request."),
+    ("dlt7", "minimal_to_broad_shift", "L6 prompt became explanation/example/full code output."),
+    ("dlt8", "explain_to_fix_shift", "L3 explanation prompt became fix/patch output."),
+    ("dlt9", "review_replacement", "L5 review/yes-no prompt became rewrite/replacement."),
+    ("dlt10", "design_contamination_delta", "L4 implement-my-flow prompt got AI-added design."),
 ]
+
+FIELD_INDEX = {name: idx for idx, (_, name, _) in enumerate(VECTOR_FIELDS)}
 
 
 def vector_detail(values: Sequence[float | int] | None) -> list[dict[str, Any]]:
@@ -60,14 +102,12 @@ def vector_detail(values: Sequence[float | int] | None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, (key, name, description) in enumerate(VECTOR_FIELDS):
         value = normalized[index] if index < len(normalized) else 0.0
-        rows.append(
-            {
-                "index": index,
-                "key": key,
-                "name": name,
-                "value": round(value, 4),
-                "active": value >= 0.5,
-                "description": description,
-            }
-        )
+        rows.append({
+            "index": index,
+            "key": key,
+            "name": name,
+            "value": round(value, 4),
+            "active": value >= 0.5,
+            "description": description,
+        })
     return rows

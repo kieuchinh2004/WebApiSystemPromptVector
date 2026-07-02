@@ -1,9 +1,7 @@
-"""Fast rule-based feature pre-extraction for APC transaction vectors.
+"""Rule-based feature extraction for Prompt A/E/C + Output 6D vectors.
 
-The LLM still handles semantic judgments, but obvious evidence is extracted with
-regex/rules first.  This improves speed, stability, and bypass resistance:
-student self-labels are ignored, while observable artifacts and action verbs are
-anchored deterministically.
+Rules are deterministic lower-bound evidence. The LLM extractor may still fill
+semantic values, but obvious artifacts/verbs/output forms are anchored here.
 """
 
 from __future__ import annotations
@@ -12,11 +10,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from apc_v4_engine import PROMPT_VECTOR_SIZE, VECTOR_SIZE
-from vector_schema import VECTOR_FIELDS
-
-
-FIELD_INDEX = {name: idx for idx, (_, name, _) in enumerate(VECTOR_FIELDS)}
+from apc_v4_engine import LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE, PROMPT_VECTOR_SIZE, VECTOR_SIZE
+from vector_schema import FIELD_INDEX
 
 
 @dataclass
@@ -28,7 +23,7 @@ class RuleEvidence:
         idx = FIELD_INDEX[field_name]
         self.vector[idx] = max(self.vector[idx], float(value))
         if evidence:
-            self.hits.setdefault(field_name, []).append(evidence[:160])
+            self.hits.setdefault(field_name, []).append(evidence[:180])
 
 
 def _has(pattern: str, text: str, flags: int = re.IGNORECASE | re.MULTILINE) -> re.Match[str] | None:
@@ -37,13 +32,32 @@ def _has(pattern: str, text: str, flags: int = re.IGNORECASE | re.MULTILINE) -> 
 
 def _hit(pattern: str, text: str, flags: int = re.IGNORECASE | re.MULTILINE) -> str | None:
     m = _has(pattern, text, flags)
-    if not m:
-        return None
-    return m.group(0).strip()
+    return m.group(0).strip() if m else None
 
 
 def _line_count(text: str) -> int:
     return len([line for line in (text or "").splitlines() if line.strip()])
+
+
+def _code_line_count(text: str) -> int:
+    n = 0
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _has(r"^(#include|using |import |from |def |class |function |const |let |var |public |private |protected |return\b|if\b|for\b|while\b|SELECT\b|INSERT\b|UPDATE\b|DELETE\b|CREATE\b)", line):
+            n += 1
+        elif _has(r"[{};]$|=>|\w+\s*=\s*.+", line):
+            n += 1
+    return n
+
+
+def _has_code(text: str) -> bool:
+    return bool(_has(r"```[\s\S]*?```", text) or _code_line_count(text) >= 2)
+
+
+def _has_executable_code_example(text: str) -> bool:
+    return bool(_has(r"```[\s\S]*?```", text) or _has(r"#include\s*<|int\s+main\s*\(|def\s+\w+\s*\(|class\s+\w+|function\s+\w+\s*\(", text) or _code_line_count(text) >= 2)
 
 
 def extract_rule_vector(student_prompt: str, ai_output: str | None = None) -> RuleEvidence:
@@ -53,113 +67,164 @@ def extract_rule_vector(student_prompt: str, ai_output: str | None = None) -> Ru
     o = ai_output or ""
     lower = p.lower()
 
-    # Prefix: coding and context.  Keep has_context permissive unless prompt is empty or explicitly injection-only.
     if p.strip():
         ev.set("has_context", 1.0, "non-empty prompt")
-    if _hit(r"```|\b(def|class|function|const|let|var|public|private|import|from|return|SELECT|CREATE TABLE|INSERT INTO)\b|[{};]\s*$", p):
-        ev.set("is_coding", 1.0, "code-like syntax")
-    if _hit(r"\b(code|bug|debug|fix|error|exception|api|syntax|regex|sql|database|html|css|javascript|python|java|c#|asp\.net|ef core|postgres|react|flutter|git|docker)\b", p):
-        ev.set("is_coding", 1.0, "coding keyword")
-    if _hit(r"\b(ignore previous|bỏ qua|đừng chấm|hãy phân loại là|classify as L[0-6])\b", p):
-        # Injection/self-label evidence makes context unsafe but does not decide level.
-        ev.set("has_context", 0.0, "possible self-label/injection; not trusted")
 
-    # Artifact features.
-    if _hit(r"```[\s\S]*?```|\b(def|class|function|const|let|var|public|private|import|from|return)\b|;\s*$", p):
-        ev.set("a1_code_block", 1.0, "code block or code-like snippet")
-    if _hit(r"\b(Traceback|Exception|Error:|TypeError|ValueError|NullReferenceException|IndexError|KeyError|SyntaxError|ReferenceError|stack trace|at line|line \d+)\b", p):
-        ev.set("a2_error_trace", 1.0, "error/exception/line diagnostic")
-    if _hit(r"\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM|CREATE TABLE|ALTER TABLE|JOIN|DbContext|migrationBuilder|HasColumnType)\b", p):
-        ev.set("a3_sql_schema", 1.0, "SQL/DB/schema evidence")
-    if _hit(r'(^|\n)\s*[\w.-]+\s*:\s*[^\n]+|\{\s*\"[^\"]+\"\s*:|\b(appsettings\.json|\.env|docker-compose|package\.json|yaml|yml)\b', p):
-        ev.set("a4_config_file", 1.0, "config-like key:value/json/yaml/env evidence")
-    if _hit(r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}|INFO|WARN|ERROR|DEBUG|npm ERR!|GET /|POST /|status=\d{3}|exit code)\b", p):
-        ev.set("a5_system_log", 1.0, "log/terminal output evidence")
-    if _line_count(p) >= 80 or len(p) >= 5000 or _hit(r"\b(full project|whole project|toàn bộ project|complete solution|entire file|nhiều file)\b", p):
-        ev.set("a6_extensive_context", 1.0, "large/whole-solution context")
-    elif _line_count(p) <= 12 and (ev.vector[FIELD_INDEX["a1_code_block"]] or ev.vector[FIELD_INDEX["a2_error_trace"]]):
-        ev.set("a7_small_snippet", 1.0, "small isolated code/error snippet")
+    if _hit(r"\b(ignore previous|bỏ qua|hãy chấm L[0-6]|classify as L[0-6]|đừng theo rubric)\b", p):
+        ev.set("bypass", 1.0, "self-label/bypass/injection-like phrase")
 
-    # Contribution/design evidence.
-    if _hit(r"\b(bước \d+|step \d+|pseudocode|thuật toán|algorithm|đầu tiên|sau đó|cuối cùng)\b", lower):
-        ev.set("d1_algorithm", 1.0, "student algorithm/steps")
-    if _hit(r"\b(score|formula|công thức|tính theo|weighted|trọng số|=\s*\d+(\.\d+)?\s*[*x×])\b", lower):
-        ev.set("d2_computation_logic", 1.0, "formula/computation logic")
-    if _hit(r"\b(class|entity|model|interface|module|service|repository|controller|schema|relationship|architecture)\b", lower):
-        ev.set("d3_structure", 1.0, "structure/class/entity design")
-    if _hit(r"\b(flow|pipeline|luồng|request\s*->|a\s*->\s*b|input\s*->\s*process|data flow)\b", lower):
-        ev.set("d4_data_flow", 1.0, "data/process flow")
-    if _hit(r"\b(file|hàm|function|class|line|dòng|module|component|endpoint)\s+[\w./#:-]+", lower):
-        ev.set("d5_location", 1.0, "specific location")
-    if _hit(r"\b(em nghĩ|i think|có thể do|probably because|nguyên nhân là|do .* gây ra)\b", lower):
-        ev.set("d6_hypothesis", 1.0, "hypothesized cause")
-    if _hit(r"\b(test case|unit test|expected|input|output|assert|given|when|then|kết quả mong đợi)\b", lower):
-        ev.set("d7_test_cases", 1.0, "test/expected I/O")
+    coding_kw = r"\b(code|bug|debug|fix|error|exception|api|syntax|regex|sql|database|html|css|javascript|typescript|python|java|c#|c\+\+|printf|scanf|asp\.net|ef core|postgres|react|flutter|git|docker|terminal|vscode|ide|config|module|function|controller|service|component)\b"
+    if _has(coding_kw, p) or _has_code(p):
+        ev.set("is_coding", 1.0, "coding/technical keyword or code-like text")
+    elif p.strip():
+        ev.set("ambiguous", 0.5, "non-empty but no obvious coding evidence")
 
-    # Request/expectation evidence.
-    request_patterns = [
-        ("r1_create", r"\b(viết|tạo|build|generate|create|make|code cho|làm app|from scratch|từ đầu)\b"),
-        ("r2_fix", r"\b(fix|sửa lỗi|debug|khắc phục|resolve|chữa lỗi|bị sao)\b"),
-        ("r3_add_feature", r"\b(thêm|add|extend|bổ sung|new feature|mở rộng)\b"),
-        ("r4_refactor", r"\b(refactor|optimize|clean up|restructure|format|cải thiện code)\b"),
-        ("r5_convert", r"\b(convert|translate|migrate|đổi sang|chuyển sang)\b"),
-        ("r6_explain", r"\b(tại sao|vì sao|why|how does|giải thích|explain|cơ chế|nguyên lý)\b"),
-        ("r7_implement_design", r"\b(theo thiết kế|theo thuật toán|implement theo|dựa trên flow|based on my design|tôi thiết kế)\b"),
-        ("r8_review", r"\b(review|đúng chưa|check|kiểm tra|edge case|security|bảo mật|complexity|evaluate)\b"),
-        ("r9_generate_tests", r"\b(unit test|test case|viết test|generate tests|assertion)\b"),
-        ("r10_syntax_lookup", r"\b(cú pháp|syntax|lệnh|command|api|tham số|parameter|regex|signature|flag)\b"),
-    ]
-    for field, pat in request_patterns:
+    # Artifact A.
+    if _has_code(p) or _hit(r"\b(query|component|controller|service|repository|function|hàm|file)\b", lower):
+        ev.set("existing_code_or_snippet", 1.0 if _has_code(p) else 0.5, "existing code/snippet/component evidence")
+        ev.set("localized_context", 1.0 if _has_code(p) else 0.5, "localized artifact context")
+    if _hit(r"\b(Traceback|Exception|Error:|TypeError|ValueError|NullReferenceException|IndexError|KeyError|SyntaxError|ReferenceError|stack trace|at line|line \d+|test failed|failed test|lỗi|bị lỗi)\b", p):
+        val = 1.0 if _hit(r"\b(Traceback|Exception|Error:|stack trace|line \d+|test failed)\b", p) else 0.5
+        ev.set("error_log_or_testfail", val, "error/log/test-failure evidence")
+        ev.set("debug_context_or_hypothesis", val, "debug context")
+    if _hit(r"\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM|CREATE TABLE|ALTER TABLE|JOIN|SQL|DbContext|migration|appsettings\.json|\.env|docker-compose|package\.json|terminal|command|npm |git |vscode|IDE|config|connection string)\b", p):
+        ev.set("config_sql_terminal_ide_small", 1.0, "config/sql/terminal/IDE small artifact")
+    if _line_count(p) >= 80 or len(p) >= 5000 or _hit(r"\b(full project|whole project|toàn bộ project|complete solution|entire file|bài em làm|solution của em|module của em)\b", lower):
+        ev.set("full_solution_or_module_owned", 1.0, "full/near-complete solution/module owned by student")
+        ev.set("student_solution_or_claim", 1.0, "student solution/claim for verification")
+    if _hit(r"\b(test case|unit test|expected|input|output|assert|given|when|then|edge case|kết quả mong đợi|pass/fail)\b", lower):
+        ev.set("test_or_expected_behavior", 1.0, "test/expected behavior evidence")
+    if _hit(r"\b(pseudocode|pseudo code|thuật toán|algorithm|flow|flow code|luồng|luồng code|bước \d+|step \d+|đầu tiên|sau đó|cuối cùng|validate\s*[-→>]+|hash\s*[-→>]+|save\s*[-→>]+)\b", lower):
+        ev.set("pseudocode_flow_code_how", 1.0, "pseudocode/function-level flow/HOW")
+        ev.set("student_how_flow", 1.0, "student supplied HOW/flow")
+
+    # Expectation E.
+    def req(field: str, pat: str, evidence: str):
         h = _hit(pat, lower)
         if h:
-            ev.set(field, 1.0, h)
+            ev.set(field, 1.0, h or evidence)
 
-    # Output-side evidence.  Rules only identify obvious forms/mismatches; LLM should judge subtle alignment.
+    req("create_or_add_feature_module", r"\b(viết|tạo|build|generate|create|make|code cho|làm app|from scratch|từ đầu|thêm tính năng|thêm module|add feature|new feature|module mới|chức năng mới)\b", "create/add feature/module")
+    req("fix_optimize_refactor_existing", r"\b(fix|sửa lỗi|debug|khắc phục|resolve|chữa lỗi|bị sao|tối ưu|optimize|refactor|clean up|restructure|cải thiện code)\b", "fix/optimize/refactor")
+    req("explain_direction_theory_example", r"\b(tại sao|vì sao|why|how does|giải thích|explain|cơ chế|nguyên lý|hướng đi|nên làm thế nào|cho ví dụ|example|giải thích code|lý thuyết)\b", "explain/direction/theory/example")
+    req("implement_my_pseudocode", r"\b(theo pseudo|theo pseudocode|theo flow|theo thiết kế|theo thuật toán|implement theo|dựa trên flow|based on my design|tôi thiết kế|em có flow)\b", "implement my pseudocode/flow")
+    req("review_yesno_challenge", r"\b(review|đúng chưa|đúng không|sai không|yes/no|check|kiểm tra|phản biện|challenge|edge case|security|bảo mật|complexity|evaluate)\b", "review/yes-no/challenge")
+    # Minimal lookup: short theory, syntax, config, SQL, terminal, IDE. Includes bare "what is X" when not asking why/example.
+    if _hit(r"\b(cú pháp|syntax|lệnh|command|api|tham số|parameter|regex|signature|flag|config|sql command|terminal|vscode|ide|what is|là gì)\b", lower):
+        if not ev.vector[FIELD_INDEX["explain_direction_theory_example"]] or _hit(r"\b(what is|là gì)\b", lower):
+            ev.set("minimal_lookup", 1.0, "minimal lookup / short theory / syntax / command")
+            ev.set("exact_small_need", 1.0, "exact small lookup need")
+
+    # Minimal command lookup like "lệnh git tạo branch" contains verb "tạo" but should be L6, not L1.
+    if ev.vector[FIELD_INDEX["minimal_lookup"]] >= 0.5 and _hit(r"\b(lệnh|command|git|terminal|sql|cú pháp|syntax|api|tham số|parameter)\b", lower):
+        if not _hit(r"\b(app|project|module mới|feature|chức năng|full|toàn bộ|code cho)\b", lower):
+            ev.vector[FIELD_INDEX["create_or_add_feature_module"]] = 0.0
+
+    # Vibe/spec only and WHAT-only.
+    has_artifact = max(ev.vector[FIELD_INDEX[n]] for n in ["existing_code_or_snippet", "error_log_or_testfail", "config_sql_terminal_ide_small", "full_solution_or_module_owned", "test_or_expected_behavior", "pseudocode_flow_code_how"])
+    if p.strip() and has_artifact < 0.5 and ev.vector[FIELD_INDEX["minimal_lookup"]] < 0.5:
+        ev.set("spec_or_vibe_only", 1.0, "natural-language spec/vibe code; no technical artifact/HOW")
+        ev.set("what_only", 1.0, "WHAT-only contribution")
+    if ev.vector[FIELD_INDEX["create_or_add_feature_module"]] >= 0.5 and ev.vector[FIELD_INDEX["pseudocode_flow_code_how"]] < 0.5:
+        ev.set("spec_or_vibe_only", 1.0, "create request without HOW => L1/vibe code")
+        ev.set("what_only", 1.0, "WHAT-only create request")
+
+    if _hit(r"\b(em nghĩ|i think|có thể do|probably because|nguyên nhân là|do .* gây ra|lỗi ở|ở hàm|ở dòng)\b", lower):
+        ev.set("debug_context_or_hypothesis", 1.0, "debug hypothesis/location")
+    if ev.vector[FIELD_INDEX["review_yesno_challenge"]] >= 0.5 and max(ev.vector[FIELD_INDEX["full_solution_or_module_owned"]], ev.vector[FIELD_INDEX["test_or_expected_behavior"]]) >= 0.5:
+        ev.set("student_solution_or_claim", 1.0, "student has artifact/claim for review")
+
+    # Output 6D.
     if o.strip():
         ev.set("output_present", 1.0, "AI output present")
         out_lower = o.lower()
-        if _hit(r"```|\b(def|class|function|const|let|var|public|private|import|return)\b", o):
-            ev.set("output_direct_code_patch", 1.0, "code appears in output")
-        if _line_count(o) >= 70 or _hit(r"\b(full implementation|complete solution|entire program|toàn bộ code|full code)\b", out_lower):
-            ev.set("output_complete_solution", 1.0, "large/full solution output")
-        if _hit(r"\b(because|vì|do đó|nguyên nhân|cơ chế|why|how|giải thích|lý do)\b", out_lower):
-            ev.set("output_explanation", 1.0, "explanatory output")
-        if _hit(r"\b(review|edge case|security|complexity|đúng|sai|vấn đề|recommend|rủi ro)\b", out_lower):
-            ev.set("output_review_feedback", 1.0, "review-like output")
-        if _hit(r"\b(test|assert|expected|pytest|unittest|jest|xunit|input|output)\b", out_lower):
-            ev.set("output_tests", 1.0, "tests in output")
-        if _line_count(o) <= 15 and _hit(r"\b(syntax|command|api|parameter|regex|cú pháp|lệnh)\b", out_lower):
-            ev.set("output_narrow_reference", 1.0, "narrow reference output")
+        code_lines = _code_line_count(o)
+        has_exec_code = _has_executable_code_example(o)
+        line_count = _line_count(o)
 
-        # Obvious mismatch heuristics based on prompt request vs output form.
-        if ev.vector[FIELD_INDEX["r10_syntax_lookup"]] >= 0.5 and ev.vector[FIELD_INDEX["output_complete_solution"]] >= 0.5:
-            ev.set("over_scope_broader", 1.0, "syntax lookup received complete solution")
-            ev.set("role_escalation", 1.0, "lookup role escalated")
-        if ev.vector[FIELD_INDEX["r6_explain"]] >= 0.5 and ev.vector[FIELD_INDEX["output_direct_code_patch"]] >= 0.5 and ev.vector[FIELD_INDEX["output_explanation"]] < 0.5:
-            ev.set("form_or_pedagogy_mismatch", 1.0, "explanation request received mostly code")
-        if ev.vector[FIELD_INDEX["r8_review"]] >= 0.5 and ev.vector[FIELD_INDEX["output_complete_solution"]] >= 0.5:
-            ev.set("agency_takeover", 1.0, "review request received full rewrite")
+        if _hit(r"\b(could you clarify|can you provide|bạn muốn|cần thêm|hãy gửi|chưa đủ thông tin|clarify)\b", out_lower):
+            ev.set("under_answer", 0.5, "AI asks for clarification / incomplete")
+        if line_count <= 5:
+            ev.set("scope_minimal", 1.0, "short/minimal output")
+        elif line_count <= 25:
+            ev.set("scope_local", 1.0, "local output length")
+        elif line_count <= 80:
+            ev.set("scope_module", 0.75, "module-sized output")
+        else:
+            ev.set("scope_full_system", 1.0, "full-system-sized output")
+
+        if _hit(r"\b(full implementation|complete solution|entire program|toàn bộ code|full code|full project|module hoàn chỉnh)\b", out_lower) or line_count >= 80:
+            ev.set("out_full_build", 1.0, "full build output")
+            ev.set("form_full_code", 1.0, "full code form")
+            ev.set("agency_ai_led", 1.0, "AI-led full build")
+            ev.set("scope_full_system", 1.0, "full-system scope")
+        if _hit(r"\b(here(?:'s| is) the fix|replace with|use this code|patch below|sửa thành|đổi thành|fixed code|refactor)\b", out_lower) or (has_exec_code and ev.vector[FIELD_INDEX["fix_optimize_refactor_existing"]] >= 0.5):
+            ev.set("out_fix_optimize_refactor", 1.0, "fix/patch/refactor output")
+            ev.set("form_patch", 1.0, "patch form")
+            ev.set("scope_local", 1.0, "local patch scope")
+        if _hit(r"\b(because|vì|do đó|nguyên nhân|cơ chế|why|how|giải thích|lý do|means|used to|comes from|format)\b", out_lower):
+            ev.set("out_explain_example", 1.0, "explanation/theory output")
+            ev.set("pedagogy_reasoned", 1.0, "reasoned explanation")
+            if has_exec_code or _hit(r"\b(example|ví dụ)\b", out_lower):
+                ev.set("form_explanation_example", 1.0, "explanation plus example/code example")
+                ev.set("scope_local", max(ev.vector[FIELD_INDEX["scope_local"]], 0.75), "example expands scope to local")
+        if _hit(r"\b(theo flow|theo pseudocode|theo thiết kế|implements your flow|based on your flow)\b", out_lower):
+            ev.set("out_implement_pseudocode", 1.0, "implementation of student pseudocode")
+            ev.set("form_implementation", 1.0, "implementation form")
+            ev.set("agency_student_led", 1.0, "student-led design preserved")
+        if _hit(r"\b(review|edge case|security|complexity|đúng|sai|vấn đề|recommend|rủi ro|phản biện|checklist|yes)\b", out_lower):
+            ev.set("out_review_yesno_challenge", 1.0, "review/yes-no/challenge output")
+            ev.set("form_review_checklist", 1.0, "review/checklist form")
+            ev.set("pedagogy_diagnostic", 1.0, "diagnostic review")
+        if line_count <= 8 and _hit(r"\b(syntax|command|api|parameter|regex|cú pháp|lệnh|config|sql|terminal|vscode|ide|printf\s*\(|%d)\b", out_lower) and not has_exec_code:
+            ev.set("out_minimal_lookup", 1.0, "minimal lookup output")
+            ev.set("form_command_short", 1.0, "short command/syntax form")
+            ev.set("scope_minimal", 1.0, "minimal scope")
+            ev.set("pedagogy_brief", 1.0, "brief direct output")
+
+        if has_exec_code and ev.vector[FIELD_INDEX["out_full_build"]] < 0.5 and ev.vector[FIELD_INDEX["out_fix_optimize_refactor"]] < 0.5:
+            ev.set("out_explain_example", max(ev.vector[FIELD_INDEX["out_explain_example"]], 0.75), "code example in explanatory output")
+            ev.set("form_explanation_example", 1.0, "code example form")
+            ev.set("scope_local", max(ev.vector[FIELD_INDEX["scope_local"]], 0.75), "code example local scope")
+
+        if has_exec_code and max(ev.vector[FIELD_INDEX["pedagogy_reasoned"]], ev.vector[FIELD_INDEX["pedagogy_diagnostic"]]) < 0.5:
+            ev.set("pedagogy_code_only", 1.0, "mostly code-only/copy-paste output")
+        else:
+            ev.set("pedagogy_brief", max(ev.vector[FIELD_INDEX["pedagogy_brief"]], 0.5), "some textual support")
+
+        # Mismatch heuristics from prompt expectation vs output behavior.
+        if ev.vector[FIELD_INDEX["minimal_lookup"]] >= 0.5 and max(ev.vector[FIELD_INDEX["out_explain_example"]], ev.vector[FIELD_INDEX["scope_local"]], ev.vector[FIELD_INDEX["scope_module"]], ev.vector[FIELD_INDEX["scope_full_system"]], ev.vector[FIELD_INDEX["form_explanation_example"]], ev.vector[FIELD_INDEX["form_full_code"]]) >= 0.5:
+            ev.set("minimal_to_broad_shift", 1.0, "L6 prompt received explanation/example/full code")
+            ev.set("scope_overreach", 1.0, "minimal prompt received broader output")
+            ev.set("form_mismatch", 0.75, "minimal expected form expanded")
+            ev.set("over_answer", 1.0, "more than requested")
+        if ev.vector[FIELD_INDEX["explain_direction_theory_example"]] >= 0.5 and ev.vector[FIELD_INDEX["out_fix_optimize_refactor"]] >= 0.5:
+            ev.set("explain_to_fix_shift", 1.0, "explain prompt received fix")
+            ev.set("role_shift", 1.0, "role shifted from explain to fix")
+        if ev.vector[FIELD_INDEX["review_yesno_challenge"]] >= 0.5 and (ev.vector[FIELD_INDEX["out_full_build"]] >= 0.5 or ev.vector[FIELD_INDEX["replaced_student_solution"]] >= 0.5):
+            ev.set("review_replacement", 1.0, "review prompt received replacement")
+            ev.set("agency_takeover", 1.0, "AI replaced student solution")
+        if ev.vector[FIELD_INDEX["implement_my_pseudocode"]] >= 0.5 and ev.vector[FIELD_INDEX["design_contamination"]] >= 0.5:
+            ev.set("design_contamination_delta", 1.0, "L4 design contaminated by AI")
 
     return ev
 
 
-def merge_rule_and_llm_vectors(llm_values: Sequence[float], rule: RuleEvidence) -> list[float]:
-    """Merge deterministic rule evidence with LLM features.
+def _legacy_to_new(values: Sequence[float]) -> list[float]:
+    from apc_v4_engine import _legacy_to_new as engine_legacy_to_new  # lazy import avoids cycle at module import time
+    return engine_legacy_to_new(values)
 
-    Rule evidence is a lower-bound override: if a regex sees code/error/action, that
-    feature must be active.  Non-hit rule zeros do not erase LLM semantic judgments.
-    Legacy 26D LLM vectors are padded before merging.
-    """
+
+def merge_rule_and_llm_vectors(llm_values: Sequence[float], rule: RuleEvidence) -> list[float]:
     values = [float(v) for v in llm_values]
-    if len(values) == PROMPT_VECTOR_SIZE:
-        values = values + [0.0] * (VECTOR_SIZE - PROMPT_VECTOR_SIZE)
-    if len(values) != VECTOR_SIZE:
-        raise ValueError(f"Expected {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} LLM values, got {len(llm_values)}")
-    return [max(values[i], rule.vector[i]) for i in range(VECTOR_SIZE)]
+    if len(values) == VECTOR_SIZE:
+        base = values
+    elif len(values) in (PROMPT_VECTOR_SIZE, LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE):
+        base = _legacy_to_new(values)
+    else:
+        raise ValueError(f"Expected vector length {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE}; got {len(values)}")
+    return [max(base[i], rule.vector[i]) for i in range(VECTOR_SIZE)]
 
 
 def rule_evidence_as_dict(rule: RuleEvidence) -> dict[str, Any]:
-    return {
-        "rule_vector": [round(v, 4) for v in rule.vector],
-        "hits": rule.hits,
-    }
+    return {"rule_vector": [round(v, 4) for v in rule.vector], "hits": rule.hits}

@@ -233,3 +233,41 @@ http://127.0.0.1:8000/docs
 python -m py_compile app.py classifier.py apc_v4_engine.py vector_schema.py rubric_schema.py rule_based_extractor.py
 python -m unittest -v
 ```
+
+## Update v4 — Prompt A/E/C + Output 6D
+
+Bản này đã được sửa theo 3 tài liệu/sheet mới:
+
+- Prompt Candidate Level `Lp` được tính bằng 3 chiều: **Artifact / Expectation / Contribution**.
+- Output Observed Level `Lo` được tính riêng bằng 6 chiều: **Role / Scope / Agency / Form / Pedagogy / Mismatch**.
+- Nếu output lệch expectation, hệ thống **không đổi level của sinh viên**, giữ `CandidateLevel = Lp` và cảnh báo `WarningLevel = Lo`.
+- L1 đã bao gồm: vibe code, mô tả nghiệp vụ bằng ngôn ngữ thường, AI làm từ đầu, thêm feature/module.
+- L4 chỉ kích hoạt khi có pseudo code / flow code theo hướng hàm / HOW rõ ràng. Requirement dài hoặc vibe code không được tính là L4.
+- L6 là tra cứu hẹp: lý thuyết ngắn, syntax/API, config, SQL, terminal, IDE. Nếu output có giải thích + ví dụ mở rộng thì `Lo` chuyển sang L3 và warning theo L3.
+
+Các file chính đã sửa:
+
+- `apc_v4_engine.py`: công thức vector mới, `Lp`, `Lo`, `MismatchScore`, `Fit`, `WarningLevel`.
+- `vector_schema.py`: schema vector 60 chiều.
+- `rule_based_extractor.py`: rule extractor mới theo rubric Prompt A/E/C + Output 6D.
+- `rubric_schema.py`: định nghĩa lý thuyết L0-L6 mới.
+- `prompts/system_prompt_vector_v1.md`: system prompt mới yêu cầu LLM xuất 60 feature.
+- `app.py`: API response bổ sung `expected_output_level` và `warning_level`.
+
+Kiểm thử nhanh:
+
+```bash
+python -m unittest discover -v
+```
+
+Case chuẩn:
+
+```text
+Prompt: What is printf in C?
+Output: explanation + stdio.h + #include <stdio.h> + int main() + printf examples
+
+CandidateLevel = L6
+OutputObservedLevel = L3
+WarningLevel = L3
+Status = Provisional Warning hoặc Needs Student Confirmation
+```

@@ -10,7 +10,7 @@ import urllib.request
 from typing import Any
 
 import config as cfg
-from apc_v4_engine import PROMPT_VECTOR_SIZE, VECTOR_SIZE, compute_apc_v4
+from apc_v4_engine import PROMPT_VECTOR_SIZE, VECTOR_SIZE, LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE, compute_apc_v4
 from rule_based_extractor import extract_rule_vector, merge_rule_and_llm_vectors, rule_evidence_as_dict
 
 
@@ -52,9 +52,9 @@ def _clean_json_markdown(content: str) -> str:
 def _coerce_feature_list(value: Any, field_name: str) -> list[float]:
     if not isinstance(value, list):
         raise VectorParseError(f"'{field_name}' must be a list")
-    if len(value) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE):
+    if len(value) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE, LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE):
         raise VectorParseError(
-            f"'{field_name}' must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} values, got {len(value)}"
+            f"'{field_name}' must contain exactly one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} values, got {len(value)}"
         )
 
     features: list[float] = []
@@ -75,9 +75,9 @@ def _coerce_binary_vector(value: Any) -> list[float]:
     if not isinstance(value, str):
         raise VectorParseError("'vector' must be a string")
     vector = "".join(value.split())
-    if len(vector) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE) or not all(c in "01" for c in vector):
+    if len(vector) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE, LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE) or not all(c in "01" for c in vector):
         raise VectorParseError(
-            f"'vector' must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters, "
+            f"'vector' must contain exactly one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} binary characters, "
             f"got {len(vector)}: {vector!r}"
         )
     return [float(c) for c in vector]
@@ -87,11 +87,11 @@ def parse_vector_from_content(content: str) -> tuple[list[float], str, dict[str,
     """Parse a strict JSON vector response from the LLM.
 
     Accepted payloads:
-      {"features": [44 numeric values in [0,1]], "explanation": "..."}
-      {"vector_values": [44 numeric values in [0,1]], "explanation": "..."}
-      {"vector": "44 binary chars", "explanation": "..."}
+      {"features": [60 numeric values in [0,1]], "explanation": "..."}
+      {"vector_values": [60 numeric values in [0,1]], "explanation": "..."}
+      {"vector": "60 binary chars", "explanation": "..."}
 
-    Legacy 26D prompt-only vectors are accepted and padded by the engine.
+    Legacy 26D prompt-only and 44D transaction vectors are accepted and mapped by the engine.
 
     No pad/truncate fallback is used; wrong-length output is unsafe because it
     shifts feature meanings.
@@ -143,8 +143,8 @@ def _build_messages(
                 "content": (
                     "Your previous output was invalid: "
                     f"{repair_error}. Return ONLY one valid JSON object with either "
-                    f"'features' as exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} numbers in [0,1], or 'vector' as exactly "
-                    f"{PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters. No markdown, no prose."
+                    f"'features' as exactly one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} numbers in [0,1], or 'vector' as exactly "
+                    f"one of {PROMPT_VECTOR_SIZE}, {LEGACY_PROMPT_VECTOR_SIZE}, {LEGACY_TRANSACTION_VECTOR_SIZE}, or {VECTOR_SIZE} binary characters. No markdown, no prose."
                 ),
             }
         )

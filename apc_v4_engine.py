@@ -1,12 +1,10 @@
-"""Deterministic APC v4 transaction scoring engine.
+"""Deterministic scoring engine for Prompt A/E/C + Output 6D vector model.
 
-Rubric-grounded vector model:
-- Rubric is the theoretical standard for L0-L6.
-- Prompt vector operationalizes Artifact / Expectation / Contribution to select
-  a candidate student level.
-- Output vector does NOT re-score the student's capability.  It only checks
-  whether AI_OUTPUT matched the student's expectation.  If it did not match, the
-  engine keeps candidate_level but returns a confirmation-required status.
+This version follows the user's two rubric sheets and the v4 formula document:
+- Prompt Candidate Level Lp is computed only from Artifact / Expectation / Contribution.
+- Output Observed Level Lo is computed independently from 6D output evidence:
+  Role / Scope / Agency / Form / Pedagogy / Mismatch.
+- If output deviates from the prompt expectation, the system keeps Lp and warns by Lo.
 """
 
 from __future__ import annotations
@@ -15,47 +13,151 @@ import math
 from typing import Any, Sequence
 
 from rubric_schema import RUBRIC_LEVELS
+from vector_schema import FIELD_INDEX, VECTOR_FIELDS
 
+PROMPT_VECTOR_SIZE = 24   # p1..p5 + a1..a7 + e1..e6 + c1..c6
+LEGACY_PROMPT_VECTOR_SIZE = 26
+LEGACY_TRANSACTION_VECTOR_SIZE = 44
+VECTOR_SIZE = len(VECTOR_FIELDS)  # 60
 
-PROMPT_VECTOR_SIZE = 26
-VECTOR_SIZE = 44
 TAU = 8.0
 ACCEPT_CONFIDENCE = 0.60
 ACCEPT_MARGIN = 0.15
 GATING_THRESHOLD = 0.50
-ALIGNMENT_ACCEPT_THRESHOLD = 0.75
-MISMATCH_REJECT_THRESHOLD = 0.30
+STABLE_FIT_THRESHOLD = 0.70
+WARNING_THRESHOLD = 0.30
+CONFIRM_THRESHOLD = 0.60
 
 LEVELS = tuple(f"L{i}" for i in range(1, 7))
 CONTEXT_LEVEL = "Thieu context"
 CONFIRMATION_LEVEL = "Can hoi lai SV"
 
 
-def _parse_vector(vector_input: str | Sequence[float | int]) -> list[float]:
-    """Parse either legacy 26D prompt vector or new 44D transaction vector."""
+def _idx(name: str) -> int:
+    return FIELD_INDEX[name]
 
+
+def _blank() -> list[float]:
+    return [0.0] * VECTOR_SIZE
+
+
+def _clamp(v: float) -> float:
+    return min(1.0, max(0.0, float(v)))
+
+
+def _legacy_to_new(values: Sequence[float]) -> list[float]:
+    """Map the old 26D/44D vectors into the new 60D schema.
+
+    This keeps backward compatibility with previous tests/API clients while making the
+    new vector layout the canonical one.
+    """
+    old = list(values)
+    x = _blank()
+    x[_idx("is_coding")] = old[0] if len(old) > 0 else 0.0
+    x[_idx("has_context")] = old[1] if len(old) > 1 else 0.0
+
+    if len(old) < LEGACY_PROMPT_VECTOR_SIZE:
+        return x
+
+    # Old prompt features: prefix + a1..a7 + d1..d7 + r1..r10.
+    oa = old[2:9]
+    od = old[9:16]
+    orq = old[16:26]
+
+    # Artifact/contribution mapping.
+    if max(oa[0], oa[6]) >= 0.5:
+        x[_idx("existing_code_or_snippet")] = max(oa[0], oa[6])
+        x[_idx("localized_context")] = max(x[_idx("localized_context")], max(oa[0], oa[6]))
+    x[_idx("error_log_or_testfail")] = max(oa[1], oa[4])
+    x[_idx("config_sql_terminal_ide_small")] = max(oa[2], oa[3], oa[4])
+    x[_idx("full_solution_or_module_owned")] = oa[5]
+    x[_idx("test_or_expected_behavior")] = od[6]
+    x[_idx("pseudocode_flow_code_how")] = max(od[0], od[1], od[2], od[3])
+    x[_idx("student_how_flow")] = max(od[0], od[1], od[2], od[3])
+    x[_idx("debug_context_or_hypothesis")] = max(od[4], od[5], oa[1], oa[4])
+    x[_idx("student_solution_or_claim")] = max(oa[5], od[6])
+
+    # Expectation mapping.
+    x[_idx("create_or_add_feature_module")] = max(orq[0], orq[2])
+    x[_idx("fix_optimize_refactor_existing")] = max(orq[1], orq[3], orq[4])
+    x[_idx("explain_direction_theory_example")] = orq[5]
+    x[_idx("implement_my_pseudocode")] = orq[6]
+    x[_idx("review_yesno_challenge")] = max(orq[7], orq[8])
+    x[_idx("minimal_lookup")] = orq[9]
+
+    # WHAT-only/spec inferred when create request has no code/HOW.
+    if x[_idx("create_or_add_feature_module")] >= 0.5 and max(x[_idx("existing_code_or_snippet")], x[_idx("pseudocode_flow_code_how")]) < 0.5:
+        x[_idx("spec_or_vibe_only")] = 1.0
+        x[_idx("what_only")] = 1.0
+    if x[_idx("minimal_lookup")] >= 0.5:
+        x[_idx("exact_small_need")] = 1.0
+
+    if len(old) >= LEGACY_TRANSACTION_VECTOR_SIZE:
+        x[_idx("output_present")] = old[26]
+        role_aligned, scope_aligned, agency_aligned, form_aligned, pedagogy_aligned = old[27:32]
+        x[_idx("out_full_build")] = old[33]
+        x[_idx("out_fix_optimize_refactor")] = old[34]
+        x[_idx("out_explain_example")] = old[35]
+        x[_idx("out_review_yesno_challenge")] = max(old[36], old[37])
+        x[_idx("out_minimal_lookup")] = old[38]
+        # Scope/form/agency rough mapping from old output-form evidence.
+        x[_idx("scope_full_system")] = old[33]
+        x[_idx("scope_local")] = max(old[34], old[35], old[36], old[37])
+        x[_idx("scope_minimal")] = old[38]
+        x[_idx("agency_ai_led")] = max(old[33], old[42])
+        x[_idx("agency_student_led")] = agency_aligned
+        x[_idx("replaced_student_solution")] = old[42]
+        x[_idx("form_full_code")] = old[33]
+        x[_idx("form_patch")] = old[34]
+        x[_idx("form_explanation_example")] = old[35]
+        x[_idx("form_review_checklist")] = max(old[36], old[37])
+        x[_idx("form_command_short")] = old[38]
+        x[_idx("pedagogy_reasoned")] = max(old[35], pedagogy_aligned)
+        x[_idx("pedagogy_code_only")] = old[33]
+        x[_idx("scope_overreach")] = old[39]
+        x[_idx("under_answer")] = old[40]
+        x[_idx("role_shift")] = old[41]
+        x[_idx("agency_takeover")] = old[42]
+        x[_idx("form_mismatch")] = old[43]
+        x[_idx("over_answer")] = max(old[39], old[41])
+        if x[_idx("minimal_lookup")] >= 0.5:
+            x[_idx("minimal_to_broad_shift")] = max(old[33], old[35], old[39])
+        if x[_idx("explain_direction_theory_example")] >= 0.5:
+            x[_idx("explain_to_fix_shift")] = old[34]
+        if x[_idx("review_yesno_challenge")] >= 0.5:
+            x[_idx("review_replacement")] = old[42]
+        if x[_idx("implement_my_pseudocode")] >= 0.5:
+            x[_idx("design_contamination_delta")] = old[42]
+
+    return x
+
+
+def _parse_vector(vector_input: str | Sequence[float | int]) -> list[float]:
     if isinstance(vector_input, str):
         vector_str = "".join(vector_input.split())
-        if len(vector_str) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE) or not all(c in "01" for c in vector_str):
+        allowed_lengths = {LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE, PROMPT_VECTOR_SIZE, VECTOR_SIZE}
+        if len(vector_str) not in allowed_lengths or not all(c in "01" for c in vector_str):
             raise ValueError(
-                f"Vector string must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} binary characters, "
+                f"Vector string must contain exactly one of {sorted(allowed_lengths)} binary characters, "
                 f"got {len(vector_str)}: {vector_str!r}"
             )
         values = [float(c) for c in vector_str]
     else:
-        if len(vector_input) not in (PROMPT_VECTOR_SIZE, VECTOR_SIZE):
+        allowed_lengths = {LEGACY_PROMPT_VECTOR_SIZE, LEGACY_TRANSACTION_VECTOR_SIZE, PROMPT_VECTOR_SIZE, VECTOR_SIZE}
+        if len(vector_input) not in allowed_lengths:
             raise ValueError(
-                f"Vector list must contain exactly {PROMPT_VECTOR_SIZE} or {VECTOR_SIZE} elements, "
-                f"got {len(vector_input)}"
+                f"Vector list must contain exactly one of {sorted(allowed_lengths)} elements, got {len(vector_input)}"
             )
         values = [float(v) for v in vector_input]
         invalid = [v for v in values if not 0.0 <= v <= 1.0]
         if invalid:
             raise ValueError(f"Vector values must be in [0, 1], got invalid values: {invalid[:5]}")
 
+    if len(values) == VECTOR_SIZE:
+        return values
     if len(values) == PROMPT_VECTOR_SIZE:
-        values = values + [0.0] * (VECTOR_SIZE - PROMPT_VECTOR_SIZE)
-    return values
+        return values + [0.0] * (VECTOR_SIZE - PROMPT_VECTOR_SIZE)
+    return _legacy_to_new(values)
 
 
 def _binary_view(values: Sequence[float]) -> str:
@@ -65,275 +167,216 @@ def _binary_view(values: Sequence[float]) -> str:
 def _softmax(scores: Sequence[float], active: Sequence[bool] | None = None) -> list[float]:
     if active is None:
         active = [True] * len(scores)
-    if len(scores) != len(active):
-        raise ValueError("scores and active mask must have the same length")
-
     active_scores = [score for score, enabled in zip(scores, active) if enabled]
     if not active_scores:
-        raise ValueError("At least one active level is required")
-
+        active_scores = list(scores)
+        active = [True] * len(scores)
     max_logit = max(TAU * score for score in active_scores)
-    exps: list[float] = []
-    for score, enabled in zip(scores, active):
-        exps.append(math.exp(TAU * score - max_logit) if enabled else 0.0)
-    total = sum(exps)
+    exps = [math.exp(TAU * score - max_logit) if enabled else 0.0 for score, enabled in zip(scores, active)]
+    total = sum(exps) or 1.0
     return [value / total for value in exps]
 
 
 def _top_margin(probs: Sequence[float]) -> float:
-    sorted_probs = sorted(probs, reverse=True)
-    if len(sorted_probs) < 2:
-        return sorted_probs[0] if sorted_probs else 0.0
-    return sorted_probs[0] - sorted_probs[1]
+    vals = sorted(probs, reverse=True)
+    return vals[0] - vals[1] if len(vals) > 1 else (vals[0] if vals else 0.0)
 
 
 def _active(value: float) -> bool:
     return value >= GATING_THRESHOLD
 
 
-def _alignment_score(role: float, scope: float, agency: float, form: float, pedagogy: float) -> float:
-    # Role/scope/agency are weighted highest because they protect against output-driven misclassification.
-    return 0.25 * role + 0.25 * scope + 0.20 * agency + 0.15 * form + 0.15 * pedagogy
+def _field(x: Sequence[float], name: str) -> float:
+    return float(x[_idx(name)])
 
 
-def _mismatch_score(over_scope: float, under_answer: float, role_escalation: float, agency_takeover: float, form_pedagogy: float) -> float:
-    # Over-scope and agency takeover are most harmful in learning analytics because AI behavior can hide student agency.
-    return 0.25 * over_scope + 0.15 * under_answer + 0.20 * role_escalation + 0.25 * agency_takeover + 0.15 * form_pedagogy
+def _role_index_from_prompt(x: Sequence[float], candidate_level: str) -> int:
+    mapping = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5, "L6": 6}
+    return mapping.get(candidate_level, 0)
 
 
-def _infer_output_level(
-    complete_solution: float,
-    direct_code_patch: float,
-    review_feedback: float,
-    tests: float,
-    explanation: float,
-    narrow_reference: float,
-) -> str | None:
-    """Classify which rubric level the AI_OUTPUT itself resembles, based on its form.
-
-    Ordered from most to least "delegated" so that when several forms are present
-    at once (e.g. an explanation padded with a full worked code example), the
-    reading reflects the broadest scope the output actually delivered.
-    """
-
-    if _active(complete_solution):
-        return "L1"
-    if _active(direct_code_patch):
-        return "L2"
-    if _active(review_feedback) or _active(tests):
-        return "L5"
-    if _active(explanation):
-        return "L3"
-    if _active(narrow_reference):
-        return "L6"
-    return None
+def _role_index_from_output(output_level: str | None) -> int:
+    mapping = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5, "L6": 6}
+    return mapping.get(output_level or "", 0)
 
 
-def _confirmation_reasons(
-    names_and_values: Sequence[tuple[str, float]],
-    alignment_score: float,
-    mismatch_score: float,
-) -> list[str]:
-    reasons = [name for name, value in names_and_values if _active(value)]
-    if alignment_score < ALIGNMENT_ACCEPT_THRESHOLD:
-        reasons.append(f"alignment_score_below_{ALIGNMENT_ACCEPT_THRESHOLD:.2f}")
-    if mismatch_score >= MISMATCH_REJECT_THRESHOLD:
-        reasons.append(f"mismatch_score_at_or_above_{MISMATCH_REJECT_THRESHOLD:.2f}")
-    return reasons
+def _scope_expected(candidate_level: str) -> int:
+    return {"L1": 3, "L2": 2, "L3": 1, "L4": 2, "L5": 1, "L6": 1}.get(candidate_level, 1)
+
+
+def _scope_observed(x: Sequence[float]) -> int:
+    vals = [
+        (_field(x, "scope_minimal"), 1),
+        (_field(x, "scope_local"), 2),
+        (_field(x, "scope_module"), 3),
+        (_field(x, "scope_full_system"), 4),
+    ]
+    return max(vals, key=lambda t: (t[0], t[1]))[1]
 
 
 def _level_mismatch_warning(candidate_level: str, output_level: str | None) -> str | None:
-    """Warn using the level the OUTPUT itself resembles (not the prompt's
-    candidate_level), so SV sees e.g. "AI answered like L3" instead of a
-    generic mismatch code when the mismatch is really a level shift.
-
-    Computed independently of the alignment/mismatch flags so a level shift is
-    always surfaced, even on transactions the extractor otherwise marked aligned.
-    """
-
     if output_level is None or output_level == candidate_level:
         return None
-    output_rubric = RUBRIC_LEVELS[output_level]
-    candidate_rubric = RUBRIC_LEVELS[candidate_level]
+    output_rubric = RUBRIC_LEVELS.get(output_level)
+    candidate_rubric = RUBRIC_LEVELS.get(candidate_level)
+    if not output_rubric or not candidate_rubric:
+        return None
     return (
-        f"output_behaves_like_{output_level}_not_{candidate_level}: "
-        f"AI_OUTPUT matches '{output_rubric.name}' pattern ({output_rubric.core_definition}) "
-        f"but candidate level is {candidate_level} ('{candidate_rubric.name}'), which expects: "
-        f"{candidate_rubric.output_should}"
+        f"Warning {output_level}: AI_OUTPUT behaves like {output_level} ({output_rubric.name}) "
+        f"while STUDENT_PROMPT candidate is {candidate_level} ({candidate_rubric.name})."
     )
 
 
 def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
-    """Compute APC scores, gated prediction, confidence, and transaction status."""
-
-    x = _parse_vector(vector_input)
+    x = [_clamp(v) for v in _parse_vector(vector_input)]
     vector_values = [round(value, 4) for value in x]
     vector_str = _binary_view(x)
 
-    is_coding = _active(x[0])
-    has_context = _active(x[1])
+    is_coding = _active(_field(x, "is_coding")) and not _active(_field(x, "non_coding"))
+    has_context = _active(_field(x, "has_context")) and not _active(_field(x, "bypass"))
 
-    a1, a2, a3, a4, a5, a6, a7 = x[2:9]
-    d1, d2, d3, d4, d5, d6, d7 = x[9:16]
-    r1, r2, r3, r4, r5, r6, r7, r8, r9, r10 = x[16:26]
+    # Prompt side fields.
+    a1 = _field(x, "spec_or_vibe_only")
+    a2 = _field(x, "existing_code_or_snippet")
+    a3 = _field(x, "error_log_or_testfail")
+    a4 = _field(x, "config_sql_terminal_ide_small")
+    a5 = _field(x, "full_solution_or_module_owned")
+    a6 = _field(x, "test_or_expected_behavior")
+    a7 = _field(x, "pseudocode_flow_code_how")
+    e1 = _field(x, "create_or_add_feature_module")
+    e2 = _field(x, "fix_optimize_refactor_existing")
+    e3 = _field(x, "explain_direction_theory_example")
+    e4 = _field(x, "implement_my_pseudocode")
+    e5 = _field(x, "review_yesno_challenge")
+    e6 = _field(x, "minimal_lookup")
+    c1 = _field(x, "what_only")
+    c2 = _field(x, "localized_context")
+    c3 = _field(x, "debug_context_or_hypothesis")
+    c4 = _field(x, "student_how_flow")
+    c5 = _field(x, "student_solution_or_claim")
+    c6 = _field(x, "exact_small_need")
 
-    (
-        o_present,
-        o_role_aligned,
-        o_scope_aligned,
-        o_agency_aligned,
-        o_form_aligned,
-        o_pedagogy_aligned,
-        o_asks_clarification,
-        o_complete_solution,
-        o_direct_code_patch,
-        o_explanation,
-        o_review_feedback,
-        o_tests,
-        o_narrow_reference,
-        m_over_scope,
-        m_under_answer,
-        m_role_escalation,
-        m_agency_takeover,
-        m_form_pedagogy_mismatch,
-    ) = x[26:44]
-
-    constraint_warnings: list[str] = []
-    if a6 >= GATING_THRESHOLD and a7 >= GATING_THRESHOLD:
-        constraint_warnings.append(
-            "Invalid feature combination: a6(extensive_context) and a7(small_snippet) are both active. "
-            "Scoring kept the values but accept is forced to 0."
-        )
-
-    # Prompt-side score formulas.  These select candidate_level only.
-    # s1 is driven mainly by the positive "create from scratch" signal (r1), mirroring
-    # how s3/s6 lead with one dominant positive term.  Earlier this leaned on five
-    # (1-a2..a5) absence terms, which gave L1 a large score floor on sparse vectors
-    # (e.g. LLM/rule extraction returning few features for a plain "explain X" or
-    # "fix this module" prompt) and let it out-score L2/L3/L6 even when their own
-    # positive signals (a1+r2, r6, r10, ...) were correctly set.
-    s1 = (
-        0.50 * r1
-        + 0.15 * (1 - a1)
-        + 0.15 * (1 - d1)
-        + 0.10 * (1 - d2)
-        + 0.10 * (1 - r7)
-    )
-    s2 = (
-        0.10 * r2
-        + 0.10 * r3
-        + 0.10 * r4
-        + 0.10 * r5
-        + 0.20 * a1
-        + 0.10 * a5
-        + 0.10 * d5
-        + 0.05 * d6
-        + 0.10 * (1 - r6)
-        + 0.05 * (1 - r8)
-    )
-    s3 = (
-        0.40 * r6
-        + 0.10 * a2
-        + 0.10 * a7
-        + 0.15 * (1 - a6)
-        + 0.10 * (1 - r8)
-        + 0.05 * (1 - r2)
-        + 0.05 * (1 - r10)
-        + 0.05 * (1 - d5)
-    )
-    s4 = (
-        0.25 * d1
-        + 0.15 * d2
-        + 0.10 * d3
-        + 0.10 * d4
-        + 0.25 * r7
-        + 0.10 * (1 - r1)
-        + 0.05 * (1 - r8)
-    )
-    s5 = (
-        0.25 * r8
-        + 0.20 * a6
-        + 0.10 * r9
-        + 0.10 * d7
-        + 0.05 * a2
-        + 0.10 * (1 - r2)
-        + 0.10 * (1 - a7)
-        + 0.10 * (1 - r1)
-    )
-    s6 = (
-        0.40 * r10
-        + 0.15 * a7
-        + 0.15 * (1 - r1)
-        + 0.10 * (1 - d1)
-        + 0.10 * (1 - r6)
-        + 0.10 * (1 - a6)
-    )
+    s0 = 0.60 * _field(x, "non_coding") + 0.25 * _field(x, "ambiguous") + 0.15 * _field(x, "bypass")
+    s1 = 0.35 * e1 + 0.25 * a1 + 0.25 * c1 + 0.10 * (1 - a7) + 0.05 * (1 - e4)
+    s2 = 0.40 * e2 + 0.20 * a2 + 0.15 * a3 + 0.15 * max(c2, c3) + 0.05 * (1 - e3) + 0.05 * (1 - e5)
+    s3 = 0.40 * e3 + 0.15 * max(a2, a3) + 0.15 * (1 - e2) + 0.15 * (1 - e1) + 0.10 * (1 - e5) + 0.05 * (1 - e6)
+    s4 = 0.40 * e4 + 0.35 * max(a7, c4) + 0.15 * (1 - e1) + 0.10 * (1 - e5)
+    s5 = 0.35 * e5 + 0.25 * max(a5, c5) + 0.20 * max(a6, c5) + 0.10 * (1 - e2) + 0.10 * (1 - e1)
+    s6 = 0.45 * e6 + 0.20 * a4 + 0.15 * c6 + 0.10 * (1 - e3) + 0.10 * (1 - e1)
     scores = [s1, s2, s3, s4, s5, s6]
 
     gatings = [
-        True,
-        True,
-        True,
-        (d1 >= GATING_THRESHOLD or d2 >= GATING_THRESHOLD or d3 >= GATING_THRESHOLD or d4 >= GATING_THRESHOLD)
-        and r7 >= GATING_THRESHOLD,
-        a6 >= GATING_THRESHOLD and r8 >= GATING_THRESHOLD,
-        r10 >= GATING_THRESHOLD,
+        e1 >= 0.50 or (a1 >= 0.50 and c1 >= 0.50 and a7 < 0.50),
+        e2 >= 0.50 and max(a2, a3, c2, c3) >= 0.50,
+        e3 >= 0.50 and e2 < 0.50 and e1 < 0.50,
+        e4 >= 0.50 and max(a7, c4) >= 0.50,
+        e5 >= 0.50 and max(a5, a6, c5) >= 0.50,
+        e6 >= 0.50 and max(e1, e2, e3, e4, e5) < 0.50,
     ]
 
-    valid_levels: list[tuple[float, int]] = []
-    for idx, (score, gated) in enumerate(zip(scores, gatings)):
-        if gated:
-            valid_levels.append((score, idx + 1))
-
+    # If no gate activates but it is coding/context, use argmax over all L1-L6 as fallback with low confidence.
+    active_mask = gatings if any(gatings) else [True] * 6
+    valid_levels = [(score, idx + 1) for idx, (score, gated) in enumerate(zip(scores, active_mask)) if gated]
     selected_score, predicted_level_idx = max(valid_levels, key=lambda item: (item[0], item[1]))
     candidate_level = f"L{predicted_level_idx}"
 
     all_probs = _softmax(scores)
-    gated_probs = _softmax(scores, gatings)
+    gated_probs = _softmax(scores, active_mask)
     selected_prob = gated_probs[predicted_level_idx - 1]
     gated_margin = _top_margin(gated_probs)
 
-    output_present = _active(o_present)
-    output_level = (
-        _infer_output_level(o_complete_solution, o_direct_code_patch, o_review_feedback, o_tests, o_explanation, o_narrow_reference)
-        if output_present
-        else None
-    )
+    # Output 6D scoring.
+    output_present = _active(_field(x, "output_present"))
+    or1 = _field(x, "out_full_build")
+    or2 = _field(x, "out_fix_optimize_refactor")
+    or3 = _field(x, "out_explain_example")
+    or4 = _field(x, "out_implement_pseudocode")
+    or5 = _field(x, "out_review_yesno_challenge")
+    or6 = _field(x, "out_minimal_lookup")
+    os1 = _field(x, "scope_minimal")
+    os2 = _field(x, "scope_local")
+    os3 = _field(x, "scope_module")
+    os4 = _field(x, "scope_full_system")
+    og1 = _field(x, "agency_ai_led")
+    og2 = _field(x, "agency_shared")
+    og3 = _field(x, "agency_student_led")
+    og4 = _field(x, "design_contamination")
+    og5 = _field(x, "replaced_student_solution")
+    of1 = _field(x, "form_full_code")
+    of2 = _field(x, "form_patch")
+    of3 = _field(x, "form_explanation_example")
+    of4 = _field(x, "form_implementation")
+    of5 = _field(x, "form_review_checklist")
+    of6 = _field(x, "form_command_short")
+    ot1 = _field(x, "pedagogy_brief")
+    ot2 = _field(x, "pedagogy_reasoned")
+    ot3 = _field(x, "pedagogy_diagnostic")
+    ot4 = _field(x, "pedagogy_code_only")
 
-    # For levels where extensive explanation is not required, pedagogy is considered OK unless an explicit mismatch fires.
-    pedagogy_effective = o_pedagogy_aligned
-    if output_present and candidate_level in {"L1", "L2", "L6"} and not _active(m_form_pedagogy_mismatch):
-        pedagogy_effective = max(pedagogy_effective, 1.0)
+    output_scores = [
+        0.35 * or1 + 0.25 * max(os3, os4) + 0.15 * og1 + 0.15 * of1 + 0.10 * ot4,
+        0.35 * or2 + 0.20 * os2 + 0.15 * of2 + 0.15 * max(og1, og2) + 0.10 * ot3 + 0.05 * (1 - or5),
+        0.35 * or3 + 0.20 * of3 + 0.20 * max(ot2, ot3) + 0.15 * max(os1, os2) + 0.10 * (1 - or2),
+        0.35 * or4 + 0.25 * og3 + 0.20 * of4 + 0.10 * os2 + 0.10 * (1 - og5),
+        0.35 * or5 + 0.25 * of5 + 0.20 * max(ot2, ot3) + 0.10 * og3 + 0.10 * (1 - og5),
+        0.40 * or6 + 0.25 * os1 + 0.20 * of6 + 0.10 * ot1 + 0.05 * (1 - or3),
+    ]
+    output_level = f"L{max(range(6), key=lambda i: (output_scores[i], i + 1)) + 1}" if output_present else None
 
-    alignment_score = _alignment_score(
-        o_role_aligned,
-        o_scope_aligned,
-        o_agency_aligned,
-        o_form_aligned,
-        pedagogy_effective,
-    )
-    mismatch_score = _mismatch_score(
-        m_over_scope,
-        m_under_answer,
-        m_role_escalation,
-        m_agency_takeover,
-        m_form_pedagogy_mismatch,
-    )
+    expected_role = _role_index_from_prompt(x, candidate_level)
+    observed_role = _role_index_from_output(output_level)
+    role_match = 1.0 if expected_role == observed_role else (0.5 if output_present and max(or1, or2, or3, or4, or5, or6) >= 0.5 else 0.0)
+    scope_exp = _scope_expected(candidate_level)
+    scope_obs = _scope_observed(x)
+    tau_scope = 1 if candidate_level == "L3" else 0
+    scope_match = 1.0 if scope_obs <= scope_exp + tau_scope else 0.0
+    agency_match = 0.0 if max(og4, og5, (og1 if candidate_level != "L1" else 0.0)) >= 0.5 else 1.0
+    form_match = 1.0 if expected_role == observed_role else 0.0
+    pedagogy_fit = max(ot1, ot2, ot3, 1 - ot4)
+
+    # Mismatch deltas: combine explicit vector flags with computed conditions.
+    # No output => no output mismatch.
+    if output_present:
+        d1 = max(_field(x, "role_shift"), 1.0 if expected_role and observed_role and expected_role != observed_role else 0.0)
+        d2 = max(_field(x, "scope_overreach"), max(0.0, scope_obs - scope_exp - tau_scope) / 3.0)
+        d3 = max(_field(x, "agency_takeover"), max(og1 if candidate_level != "L1" else 0.0, og4, og5))
+        d4 = max(_field(x, "form_mismatch"), 1.0 - form_match)
+        d5 = max(_field(x, "over_answer"), 1.0 if output_level and expected_role != observed_role and scope_obs > scope_exp else 0.0)
+        d6 = _field(x, "under_answer")
+        d7 = max(_field(x, "minimal_to_broad_shift"), (1.0 if candidate_level == "L6" else 0.0) * max(or3, os2, os3, os4, of3, of1))
+        d8 = max(_field(x, "explain_to_fix_shift"), (1.0 if candidate_level == "L3" else 0.0) * or2)
+        d9 = max(_field(x, "review_replacement"), (1.0 if candidate_level == "L5" else 0.0) * og5)
+        d10 = max(_field(x, "design_contamination_delta"), (1.0 if candidate_level == "L4" else 0.0) * og4)
+    else:
+        d1=d2=d3=d4=d5=d6=d7=d8=d9=d10=0.0
+
+    mismatch_score = 0.25 * d1 + 0.20 * d2 + 0.20 * d3 + 0.10 * d4 + 0.10 * d5 + 0.05 * d6 + 0.10 * max(d7, d8, d9, d10)
+    fit_score = 0.35 * role_match + 0.25 * scope_match + 0.20 * agency_match + 0.10 * form_match + 0.10 * pedagogy_fit - 0.20 * mismatch_score
 
     mismatch_names = [
-        ("over_scope_broader", m_over_scope),
-        ("under_answer_missing", m_under_answer),
-        ("role_escalation", m_role_escalation),
-        ("agency_takeover", m_agency_takeover),
-        ("form_or_pedagogy_mismatch", m_form_pedagogy_mismatch),
+        ("role_shift", d1), ("scope_overreach", d2), ("agency_takeover", d3),
+        ("form_mismatch", d4), ("over_answer", d5), ("under_answer", d6),
+        ("minimal_to_broad_shift", d7), ("explain_to_fix_shift", d8),
+        ("review_replacement", d9), ("design_contamination", d10),
     ]
     active_mismatches = [name for name, value in mismatch_names if _active(value)]
-    output_aligned = (
-        output_present
-        and alignment_score >= ALIGNMENT_ACCEPT_THRESHOLD
-        and mismatch_score < MISMATCH_REJECT_THRESHOLD
-        and not active_mismatches
-    )
+    # Backward-compatible aliases used by older clients/tests.
+    alias_map = {
+        "scope_overreach": "over_scope_broader",
+        "under_answer": "under_answer_missing",
+        "agency_takeover": "agency_takeover",
+        "role_shift": "role_escalation",
+    }
+    for name in list(active_mismatches):
+        alias = alias_map.get(name)
+        if alias and alias not in active_mismatches:
+            active_mismatches.append(alias)
+
+    warning_level = output_level if output_present and mismatch_score >= WARNING_THRESHOLD else None
+    level_mismatch_warning = _level_mismatch_warning(candidate_level, output_level) if has_context and is_coding and output_present else None
+    confirmation_reasons = active_mismatches.copy()
+    if level_mismatch_warning and level_mismatch_warning not in confirmation_reasons:
+        confirmation_reasons.append(level_mismatch_warning)
 
     if not has_context:
         final_level = CONTEXT_LEVEL
@@ -341,83 +384,76 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         transaction_status = "missing_context"
         final_status = "rejected_missing_context"
         requires_student_confirmation = False
-        confirmation_reasons: list[str] = []
+        warning_level = None
     elif not is_coding:
         final_level = "L0"
         accept = 0
         transaction_status = "non_coding"
         final_status = "rejected_non_coding"
         requires_student_confirmation = False
-        confirmation_reasons = []
-    elif output_present and not output_aligned:
+        warning_level = None
+    elif output_present and (mismatch_score >= CONFIRM_THRESHOLD or max(d7, d8, d9, d10) >= 0.75):
         final_level = CONFIRMATION_LEVEL
         accept = 0
         transaction_status = "output_mismatch_requires_confirmation"
         final_status = "requires_student_confirmation"
         requires_student_confirmation = True
-        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score)
+    elif output_present and mismatch_score >= WARNING_THRESHOLD:
+        final_level = candidate_level
+        accept = 0
+        transaction_status = "output_provisional_warning"
+        final_status = "provisional_warning"
+        requires_student_confirmation = False
+    elif output_present and d6 >= 0.50 and d2 < 0.30:
+        final_level = candidate_level
+        accept = 0
+        transaction_status = "incomplete_output"
+        final_status = "incomplete_output"
+        requires_student_confirmation = False
     else:
         final_level = candidate_level
-        accept = int(
-            selected_prob >= ACCEPT_CONFIDENCE
-            and gated_margin >= ACCEPT_MARGIN
-            and not constraint_warnings
-        )
+        accept = int(selected_prob >= ACCEPT_CONFIDENCE and gated_margin >= ACCEPT_MARGIN)
         transaction_status = "prompt_only" if not output_present else "output_aligned"
         final_status = "accepted" if accept else "low_confidence_or_constraint_warning"
         requires_student_confirmation = False
-        confirmation_reasons = []
 
-    # Level-shift warning: surfaced whenever AI_OUTPUT's own form maps to a
-    # different rubric level than the prompt's candidate_level, independent of
-    # whether the extractor's alignment flags already accepted the transaction.
-    # Only meaningful once candidate_level was actually usable (has_context and
-    # is_coding); accept/final_status/transaction_status are left untouched.
-    level_mismatch_warning = _level_mismatch_warning(candidate_level, output_level) if has_context and is_coding else None
-    if level_mismatch_warning is not None and level_mismatch_warning not in confirmation_reasons:
-        confirmation_reasons = confirmation_reasons + [level_mismatch_warning]
-
+    output_aligned = output_present and fit_score >= STABLE_FIT_THRESHOLD and mismatch_score < WARNING_THRESHOLD
     output_diagnostics = {
         "output_present": output_present,
         "output_aligned": output_aligned if output_present else None,
-        "alignment_score": round(alignment_score, 4) if output_present else None,
+        "fit_score": round(fit_score, 4) if output_present else None,
+        "alignment_score": round(fit_score, 4) if output_present else None,
         "mismatch_score": round(mismatch_score, 4) if output_present else None,
-        "alignment_threshold": ALIGNMENT_ACCEPT_THRESHOLD,
-        "mismatch_threshold": MISMATCH_REJECT_THRESHOLD,
-        "role_aligned": _active(o_role_aligned) if output_present else None,
-        "scope_aligned": _active(o_scope_aligned) if output_present else None,
-        "agency_aligned": _active(o_agency_aligned) if output_present else None,
-        "form_aligned": _active(o_form_aligned) if output_present else None,
-        "pedagogy_aligned": _active(pedagogy_effective) if output_present else None,
-        "asks_clarification": _active(o_asks_clarification) if output_present else None,
-        "has_mismatch": bool(active_mismatches) if output_present else None,
+        "warning_level": warning_level,
+        "expected_output_level": candidate_level if output_present else None,
+        "output_observed_level": output_level,
+        "role_match": role_match if output_present else None,
+        "scope_match": scope_match if output_present else None,
+        "agency_match": agency_match if output_present else None,
+        "form_match": form_match if output_present else None,
+        "pedagogy_fit": round(pedagogy_fit, 4) if output_present else None,
         "active_mismatches": active_mismatches if output_present else [],
         "confirmation_reasons": confirmation_reasons,
-        "output_level": output_level,
-        "output_level_name": RUBRIC_LEVELS[output_level].name if output_level else None,
-        "mismatch_types": {
-            "over_scope_broader": _active(m_over_scope),
-            "under_answer_missing": _active(m_under_answer),
-            "role_escalation": _active(m_role_escalation),
-            "agency_takeover": _active(m_agency_takeover),
-            "form_or_pedagogy_mismatch": _active(m_form_pedagogy_mismatch),
-        } if output_present else {},
-        "output_forms": {
-            "complete_solution": _active(o_complete_solution),
-            "direct_code_patch": _active(o_direct_code_patch),
-            "explanation": _active(o_explanation),
-            "review_feedback": _active(o_review_feedback),
-            "tests": _active(o_tests),
-            "narrow_reference": _active(o_narrow_reference),
+        "output_scores": [round(v, 4) for v in output_scores] if output_present else [],
+        "mismatch_types": {name: _active(value) for name, value in mismatch_names} if output_present else {},
+        "output_6d": {
+            "role": {"full_build": or1, "fix": or2, "explain_example": or3, "implement_pseudocode": or4, "review_yesno": or5, "minimal_lookup": or6},
+            "scope": {"minimal": os1, "local": os2, "module": os3, "full_system": os4},
+            "agency": {"ai_led": og1, "shared": og2, "student_led": og3, "design_contamination": og4, "replaced_solution": og5},
+            "form": {"full_code": of1, "patch": of2, "explanation_example": of3, "implementation": of4, "review_checklist": of5, "command_short": of6},
+            "pedagogy": {"brief": ot1, "reasoned": ot2, "diagnostic": ot3, "code_only": ot4},
         } if output_present else {},
     }
 
     return {
         "level": final_level,
         "candidate_level": candidate_level,
-        "predicted_level_math": candidate_level,  # backward compatibility
+        "predicted_level_math": candidate_level,
         "prompt_level": candidate_level,
+        "expected_output_level": candidate_level if output_present else None,
         "output_level": output_level,
+        "output_observed_level": output_level,
+        "warning_level": warning_level,
         "score": round(selected_score, 4),
         "confidence": round(selected_prob, 4),
         "margin": round(gated_margin, 4),
@@ -426,16 +462,18 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         "gatings": gatings,
         "probs": [round(prob, 4) for prob in gated_probs],
         "all_probs": [round(prob, 4) for prob in all_probs],
+        "output_scores": [round(v, 4) for v in output_scores] if output_present else [],
         "is_coding": is_coding,
         "has_context": has_context,
         "vector_str": vector_str,
         "vector_values": vector_values,
-        "constraint_warnings": constraint_warnings,
+        "constraint_warnings": [],
         "transaction_status": transaction_status,
         "final_status": final_status,
         "requires_student_confirmation": requires_student_confirmation,
         "confirmation_reasons": confirmation_reasons,
-        "alignment_score": round(alignment_score, 4) if output_present else None,
+        "alignment_score": round(fit_score, 4) if output_present else None,
+        "fit_score": round(fit_score, 4) if output_present else None,
         "mismatch_score": round(mismatch_score, 4) if output_present else None,
         "output_diagnostics": output_diagnostics,
     }

@@ -53,11 +53,13 @@ class ClassifyResponse(BaseModel):
     candidate_level: str = Field(..., description="Candidate level chấm từ STUDENT_PROMPT trước khi xét AI_OUTPUT")
     predicted_level_math: str = Field(..., description="Alias backward-compatible của candidate_level")
     prompt_level: str = Field(..., description="Level suy từ STUDENT_PROMPT (alias rõ nghĩa của candidate_level)")
-    output_level: Optional[str] = Field(None, description="Level suy từ hình thức AI_OUTPUT (complete_solution/direct_patch/explanation/review/tests/narrow_reference); None nếu không có AI_OUTPUT")
+    output_level: Optional[str] = Field(None, description="Output Observed Level Lo suy từ 6 chiều output; None nếu không có AI_OUTPUT")
+    expected_output_level: Optional[str] = Field(None, description="Expected Output Level Le theo Prompt Candidate Level")
+    warning_level: Optional[str] = Field(None, description="Warning Level Lw = Lo khi output lệch expectation")
     score: float = Field(..., description="Điểm số cao nhất của nhãn được chọn")
     margin: float = Field(..., description="Khoảng cách độ tin cậy giữa nhãn cao nhất và nhãn cao nhì")
     accept: int = Field(..., description="1: Chấp nhận kết quả (đáp ứng điều kiện biên), 0: Từ chối/Cảnh báo")
-    vector: str = Field(..., description="Vector 44-bit transaction-level được trích xuất từ Prompt + Output; legacy 26-bit được pad khi cần")
+    vector: str = Field(..., description="Vector 60D transaction-level được trích xuất từ Prompt + Output; legacy 26-bit được pad khi cần")
     explanation: str = Field(..., description="Giải thích/Lập luận của LLM cho việc gán vector")
     scores: List[float] = Field(..., description="Danh sách điểm số của 6 levels S1..S6")
     gatings: List[bool] = Field(..., description="Trạng thái cổng lọc G1..G6")
@@ -146,7 +148,7 @@ async def on_shutdown():
 async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
     """
     Nhận prompt học sinh và trả về phân loại APC v4 chi tiết.
-    - Trích xuất 44 đặc trưng transaction-level (26 prompt + 18 output/mismatch) qua mô hình LLM.
+    - Trích xuất 60 đặc trưng transaction-level (Prompt A/E/C + Output 6D) qua mô hình LLM.
     - Chạy bộ suy luận toán học tĩnh (score, gating, softmax, accept) để đưa ra kết quả.
     """
     text = body.prompt or body.student_prompt
@@ -176,6 +178,8 @@ async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
         predicted_level_math=result["predicted_level_math"],
         prompt_level=result.get("prompt_level", result.get("candidate_level", "N/A")),
         output_level=result.get("output_level"),
+        expected_output_level=result.get("expected_output_level"),
+        warning_level=result.get("warning_level"),
         score=result["score"],
         margin=result["margin"],
         accept=result["accept"],
@@ -230,6 +234,8 @@ async def classify_prompt_debug(body: ClassifyRequest) -> ClassifyDebugResponse:
         predicted_level_math=result["predicted_level_math"],
         prompt_level=result.get("prompt_level", result.get("candidate_level", "N/A")),
         output_level=result.get("output_level"),
+        expected_output_level=result.get("expected_output_level"),
+        warning_level=result.get("warning_level"),
         score=result["score"],
         margin=result["margin"],
         accept=result["accept"],
