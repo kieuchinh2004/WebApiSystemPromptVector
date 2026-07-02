@@ -52,6 +52,8 @@ class ClassifyResponse(BaseModel):
     has_context: bool = Field(..., description="Đặc trưng prefix: Đủ context và an toàn?")
     candidate_level: str = Field(..., description="Candidate level chấm từ STUDENT_PROMPT trước khi xét AI_OUTPUT")
     predicted_level_math: str = Field(..., description="Alias backward-compatible của candidate_level")
+    prompt_level: str = Field(..., description="Level suy từ STUDENT_PROMPT (alias rõ nghĩa của candidate_level)")
+    output_level: Optional[str] = Field(None, description="Level suy từ hình thức AI_OUTPUT (complete_solution/direct_patch/explanation/review/tests/narrow_reference); None nếu không có AI_OUTPUT")
     score: float = Field(..., description="Điểm số cao nhất của nhãn được chọn")
     margin: float = Field(..., description="Khoảng cách độ tin cậy giữa nhãn cao nhất và nhãn cao nhì")
     accept: int = Field(..., description="1: Chấp nhận kết quả (đáp ứng điều kiện biên), 0: Từ chối/Cảnh báo")
@@ -172,6 +174,8 @@ async def classify_prompt(body: ClassifyRequest) -> ClassifyResponse:
         has_context=result["has_context"],
         candidate_level=result.get("candidate_level", result.get("predicted_level_math", "N/A")),
         predicted_level_math=result["predicted_level_math"],
+        prompt_level=result.get("prompt_level", result.get("candidate_level", "N/A")),
+        output_level=result.get("output_level"),
         score=result["score"],
         margin=result["margin"],
         accept=result["accept"],
@@ -224,6 +228,8 @@ async def classify_prompt_debug(body: ClassifyRequest) -> ClassifyDebugResponse:
         has_context=result["has_context"],
         candidate_level=result.get("candidate_level", result.get("predicted_level_math", "N/A")),
         predicted_level_math=result["predicted_level_math"],
+        prompt_level=result.get("prompt_level", result.get("candidate_level", "N/A")),
+        output_level=result.get("output_level"),
         score=result["score"],
         margin=result["margin"],
         accept=result["accept"],

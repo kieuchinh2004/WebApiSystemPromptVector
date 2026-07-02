@@ -133,27 +133,34 @@ def _confirmation_reasons(
     names_and_values: Sequence[tuple[str, float]],
     alignment_score: float,
     mismatch_score: float,
-    candidate_level: str,
-    output_level: str | None,
 ) -> list[str]:
     reasons = [name for name, value in names_and_values if _active(value)]
     if alignment_score < ALIGNMENT_ACCEPT_THRESHOLD:
         reasons.append(f"alignment_score_below_{ALIGNMENT_ACCEPT_THRESHOLD:.2f}")
     if mismatch_score >= MISMATCH_REJECT_THRESHOLD:
         reasons.append(f"mismatch_score_at_or_above_{MISMATCH_REJECT_THRESHOLD:.2f}")
-    # Warn using the level the OUTPUT itself resembles (not the prompt's
-    # candidate_level), so SV sees e.g. "AI answered like L3" instead of a
-    # generic mismatch code when the mismatch is really a level shift.
-    if output_level is not None and output_level != candidate_level:
-        output_rubric = RUBRIC_LEVELS[output_level]
-        candidate_rubric = RUBRIC_LEVELS[candidate_level]
-        reasons.append(
-            f"output_behaves_like_{output_level}_not_{candidate_level}: "
-            f"AI_OUTPUT matches '{output_rubric.name}' pattern ({output_rubric.core_definition}) "
-            f"but candidate level is {candidate_level} ('{candidate_rubric.name}'), which expects: "
-            f"{candidate_rubric.output_should}"
-        )
     return reasons
+
+
+def _level_mismatch_warning(candidate_level: str, output_level: str | None) -> str | None:
+    """Warn using the level the OUTPUT itself resembles (not the prompt's
+    candidate_level), so SV sees e.g. "AI answered like L3" instead of a
+    generic mismatch code when the mismatch is really a level shift.
+
+    Computed independently of the alignment/mismatch flags so a level shift is
+    always surfaced, even on transactions the extractor otherwise marked aligned.
+    """
+
+    if output_level is None or output_level == candidate_level:
+        return None
+    output_rubric = RUBRIC_LEVELS[output_level]
+    candidate_rubric = RUBRIC_LEVELS[candidate_level]
+    return (
+        f"output_behaves_like_{output_level}_not_{candidate_level}: "
+        f"AI_OUTPUT matches '{output_rubric.name}' pattern ({output_rubric.core_definition}) "
+        f"but candidate level is {candidate_level} ('{candidate_rubric.name}'), which expects: "
+        f"{candidate_rubric.output_should}"
+    )
 
 
 def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
@@ -346,7 +353,7 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         transaction_status = "output_mismatch_requires_confirmation"
         final_status = "requires_student_confirmation"
         requires_student_confirmation = True
-        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score, candidate_level, output_level)
+        confirmation_reasons = _confirmation_reasons(mismatch_names, alignment_score, mismatch_score)
     else:
         final_level = candidate_level
         accept = int(
@@ -358,6 +365,15 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         final_status = "accepted" if accept else "low_confidence_or_constraint_warning"
         requires_student_confirmation = False
         confirmation_reasons = []
+
+    # Level-shift warning: surfaced whenever AI_OUTPUT's own form maps to a
+    # different rubric level than the prompt's candidate_level, independent of
+    # whether the extractor's alignment flags already accepted the transaction.
+    # Only meaningful once candidate_level was actually usable (has_context and
+    # is_coding); accept/final_status/transaction_status are left untouched.
+    level_mismatch_warning = _level_mismatch_warning(candidate_level, output_level) if has_context and is_coding else None
+    if level_mismatch_warning is not None and level_mismatch_warning not in confirmation_reasons:
+        confirmation_reasons = confirmation_reasons + [level_mismatch_warning]
 
     output_diagnostics = {
         "output_present": output_present,
@@ -398,6 +414,8 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         "level": final_level,
         "candidate_level": candidate_level,
         "predicted_level_math": candidate_level,  # backward compatibility
+        "prompt_level": candidate_level,
+        "output_level": output_level,
         "score": round(selected_score, 4),
         "confidence": round(selected_prob, 4),
         "margin": round(gated_margin, 4),
