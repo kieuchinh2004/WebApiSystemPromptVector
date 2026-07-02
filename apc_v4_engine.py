@@ -206,16 +206,18 @@ def compute_apc_v4(vector_input: str | Sequence[float | int]) -> dict[str, Any]:
         )
 
     # Prompt-side score formulas.  These select candidate_level only.
+    # s1 is driven mainly by the positive "create from scratch" signal (r1), mirroring
+    # how s3/s6 lead with one dominant positive term.  Earlier this leaned on five
+    # (1-a2..a5) absence terms, which gave L1 a large score floor on sparse vectors
+    # (e.g. LLM/rule extraction returning few features for a plain "explain X" or
+    # "fix this module" prompt) and let it out-score L2/L3/L6 even when their own
+    # positive signals (a1+r2, r6, r10, ...) were correctly set.
     s1 = (
-        0.30 * r1
-        + 0.10 * (1 - a1)
-        + 0.05 * (1 - a2)
-        + 0.05 * (1 - a3)
-        + 0.05 * (1 - a4)
-        + 0.05 * (1 - a5)
+        0.50 * r1
+        + 0.15 * (1 - a1)
         + 0.15 * (1 - d1)
         + 0.10 * (1 - d2)
-        + 0.15 * (1 - r7)
+        + 0.10 * (1 - r7)
     )
     s2 = (
         0.10 * r2

@@ -27,27 +27,46 @@ class TestAPCV4Engine(unittest.TestCase):
         res = compute_apc_v4(vec)
         
         # Expected values calculated by hand:
-        # S1 = 0.70, S2 = 0.15, S3 = 0.40, S4 = 0.15, S5 = 0.30, S6 = 0.45
-        self.assertAlmostEqual(res["scores"][0], 0.70, places=4)
+        # S1 = 0.50, S2 = 0.15, S3 = 0.40, S4 = 0.15, S5 = 0.30, S6 = 0.45
+        # (S1 leads with r1's positive weight plus a1/d1/d2/r7 absence terms; it no
+        # longer carries a2..a5 absence terms, so a fully empty vector no longer gives
+        # L1 an inflated score floor over levels with genuine positive signals.)
+        self.assertAlmostEqual(res["scores"][0], 0.50, places=4)
         self.assertAlmostEqual(res["scores"][1], 0.15, places=4)
         self.assertAlmostEqual(res["scores"][2], 0.40, places=4)
         self.assertAlmostEqual(res["scores"][3], 0.15, places=4)
         self.assertAlmostEqual(res["scores"][4], 0.30, places=4)
         self.assertAlmostEqual(res["scores"][5], 0.45, places=4)
-        
+
         # Gatings for zero vector:
         # G1..G3 are True. G4..G6 are False.
         self.assertEqual(res["gatings"], [True, True, True, False, False, False])
-        
+
         # Math predicted level must be L1 (highest among gated levels S1, S2, S3)
         self.assertEqual(res["predicted_level_math"], "L1")
         self.assertEqual(res["level"], "L1")
-        
+
         # Accept criteria now uses gated Softmax over active levels L1-L3 only.
-        self.assertAlmostEqual(res["confidence"], 0.9066, places=3)
-        self.assertAlmostEqual(res["margin"], 0.8245, places=3)
+        self.assertAlmostEqual(res["confidence"], 0.6622, places=3)
+        self.assertAlmostEqual(res["margin"], 0.3646, places=3)
         self.assertEqual(res["accept"], 1)
         self.assertIn("all_probs", res)
+
+    def test_l2_signal_beats_l1_default_on_sparse_vector(self):
+        # Prompt supplies a code snippet + specific location and asks for a fix
+        # (a1, a7, d5, r2) without setting any other bit.  Before the s1 rebalance
+        # this used to lose to L1's inflated absence-driven score (0.60 vs 0.55);
+        # the genuine L2 signal must now win.
+        x = [0] * 26
+        x[0] = 1  # is_coding
+        x[1] = 1  # has_context
+        x[2] = 1  # a1_code_block
+        x[8] = 1  # a7_small_snippet
+        x[13] = 1  # d5_location
+        x[17] = 1  # r2_fix
+
+        res = compute_apc_v4(x)
+        self.assertEqual(res["predicted_level_math"], "L2")
 
     def test_gating_g4_active(self):
         # We activate d1 (index 9) and r7 (index 22)
